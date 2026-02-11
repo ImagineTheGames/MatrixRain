@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+.env
+venv/
+.venv/
+
+# App
+matrix_rain_crash.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,29 @@
+{
+    "speed": {
+        "min": 2.0,
+        "max": 5.0,
+        "comment": "Falling speed range for columns (pixels per frame). Higher values = faster falling."
+    },
+    "animation": {
+        "fps": 30,
+        "comment": "Animation frames per second. Higher values = smoother but more CPU intensive."
+    },
+    "column": {
+        "min_length": 10,
+        "max_length": 30,
+        "comment": "Minimum and maximum length of each falling column (number of characters)."
+    },
+    "font": {
+        "name": "Consolas",
+        "size": 14,
+        "comment": "Font name and size for the matrix characters."
+    },
+    "custom_messages": [
+        "Only good things happen to me",
+        "meu nome eh Reinaldo Vieira e soh coisas boas acontecem comigo"
+    ],
+    "glow": {
+        "strength": 90,
+        "radius": 2
+    }
+}

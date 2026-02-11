@@ -1,0 +1,21 @@
+---
+description: When done with Matrix Rain tasks, kill any running instance and start the app (tray only, no console)
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Run Matrix Rain when done with tasks
+
+Whenever you finish tasks in this project (whether or not you changed code):
+
+1. **Kill** any running Matrix Rain process (python or pythonw):
+   ```powershell
+   Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*matrix_rain*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+   ```
+
+2. **Start** a new instance (no console, tray only):
+   ```powershell
+   Start-Process pythonw -ArgumentList "run_matrix_rain.pyw" -WorkingDirectory "X:\MyApps\MatrixRain"
+   ```
+
+Do this as the last step before replying so the app is running for the user.
