@@ -18,8 +18,8 @@ from PyQt5.QtWidgets import (
     QPushButton, QHBoxLayout, QMessageBox, QDialogButtonBox,
     QDoubleSpinBox, QLabel, QFormLayout, QSlider, QCheckBox,
 )
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QPainter, QColor, QFont, QFontMetrics, QIcon, QPixmap
+from PyQt5.QtCore import Qt, QTimer, QPoint
+from PyQt5.QtGui import QPainter, QColor, QFont, QFontMetrics, QIcon, QPixmap, QCursor
 
 # Matrix-style character set: Latin, digits, symbols + Katakana (classic Matrix look)
 MATRIX_LATIN = string.ascii_letters + string.digits + "!@#$%^&*()_+-=[]{}|;:,.<>?"
@@ -36,22 +36,94 @@ SPEED_SCALE = 0.85
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'matrix_config.json')
 
+# Windows low-level hooks for screensaver dismiss (any key or mouse = stop)
+_kb_hook_id = None
+_kb_hook_proc = None
+_mouse_hook_id = None
+_mouse_hook_proc = None
+
 def get_idle_time_ms():
     """Return system idle time in milliseconds (mouse/keyboard). Windows only; other OS returns 0."""
     try:
         if sys.platform != "win32":
             return 0
         class LASTINPUTINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
-        lib = ctypes.windll.user32  # type: ignore
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
         li = LASTINPUTINFO()
         li.cbSize = ctypes.sizeof(LASTINPUTINFO)
-        if lib.GetLastInputInfo(ctypes.byref(li)):
-            tick = lib.GetTickCount()
-            return (tick - li.dwTime) & 0x7FFFFFFF
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(li)):  # type: ignore
+            return 0
+        tick = ctypes.windll.kernel32.GetTickCount()  # type: ignore  # ms since boot, 32-bit
+        # Unsigned difference to handle GetTickCount wrap
+        idle_ms = (tick - li.dwTime) & 0xFFFFFFFF
+        return min(idle_ms, 0x7FFFFFFF)  # cap to avoid huge value on wrap
     except Exception:
         pass
     return 0
+
+def _install_screensaver_keyboard_hook(widget):
+    """Install global keyboard hook so any keypress dismisses screensaver. Windows only."""
+    global _kb_hook_id, _kb_hook_proc
+    if sys.platform != "win32" or _kb_hook_id is not None:
+        return
+    try:
+        WH_KEYBOARD_LL = 13
+        WM_KEYDOWN, WM_SYSKEYDOWN = 0x100, 0x104
+        user32 = ctypes.windll.user32  # type: ignore
+        kernel32 = ctypes.windll.kernel32  # type: ignore
+
+        def low_level_kb_proc(nCode, wParam, lParam):
+            if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                QTimer.singleShot(0, widget._dismiss_screensaver)
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        _kb_hook_proc = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)(low_level_kb_proc)
+        _kb_hook_id = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_hook_proc, kernel32.GetModuleHandleW(None), 0)
+    except Exception:
+        _kb_hook_id = None
+
+def _install_screensaver_mouse_hook(widget):
+    """Install global low-level mouse hook so any mouse move/click dismisses screensaver. Windows only."""
+    global _mouse_hook_id, _mouse_hook_proc
+    if sys.platform != "win32" or _mouse_hook_id is not None:
+        return
+    try:
+        WH_MOUSE_LL = 14
+        WM_MOUSEMOVE = 0x0200
+        user32 = ctypes.windll.user32  # type: ignore
+        kernel32 = ctypes.windll.kernel32  # type: ignore
+
+        def low_level_mouse_proc(nCode, wParam, lParam):
+            if nCode >= 0:  # Any mouse event (move, click, etc.)
+                QTimer.singleShot(0, widget._dismiss_screensaver)
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        _mouse_hook_proc = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)(low_level_mouse_proc)
+        _mouse_hook_id = user32.SetWindowsHookExW(WH_MOUSE_LL, _mouse_hook_proc, kernel32.GetModuleHandleW(None), 0)
+    except Exception:
+        _mouse_hook_id = None
+
+def _uninstall_screensaver_keyboard_hook():
+    """Remove the keyboard hook. Windows only."""
+    global _kb_hook_id
+    if sys.platform != "win32" or _kb_hook_id is None:
+        return
+    try:
+        ctypes.windll.user32.UnhookWindowsHookEx(_kb_hook_id)  # type: ignore
+    except Exception:
+        pass
+    _kb_hook_id = None
+
+def _uninstall_screensaver_mouse_hook():
+    """Remove the mouse hook. Windows only."""
+    global _mouse_hook_id
+    if sys.platform != "win32" or _mouse_hook_id is None:
+        return
+    try:
+        ctypes.windll.user32.UnhookWindowsHookEx(_mouse_hook_id)  # type: ignore
+    except Exception:
+        pass
+    _mouse_hook_id = None
 
 def _safe_int(val, default):
     """Return int(val) or default if invalid."""
@@ -69,7 +141,8 @@ def load_config():
         "font": {"name": "Consolas", "size": 14},
         "custom_messages": [],
         "glow": {"strength": 90, "radius": 3},
-        "screensaver": {"enabled": False, "idle_minutes": 1},
+        "screensaver": {"enabled": False, "idle_seconds": 60},
+        "mouse_highlight": False,
     }
     try:
         if os.path.exists(CONFIG_PATH):
@@ -92,12 +165,17 @@ def load_config():
                 else:
                     config["glow"][k] = _safe_int(config["glow"][k], default)
             if "screensaver" not in config or not isinstance(config.get("screensaver"), dict):
-                config["screensaver"] = {"enabled": False, "idle_minutes": 1}
-            for k, default in (("enabled", False), ("idle_minutes", 1)):
+                config["screensaver"] = {"enabled": False, "idle_seconds": 60}
+            # Migrate old idle_minutes to idle_seconds
+            if "idle_seconds" not in config["screensaver"] and "idle_minutes" in config["screensaver"]:
+                config["screensaver"]["idle_seconds"] = max(5, min(7200, _safe_int(config["screensaver"]["idle_minutes"], 1) * 60))
+            for k, default in (("enabled", False), ("idle_seconds", 60)):
                 if k not in config["screensaver"]:
                     config["screensaver"][k] = default
-                elif k == "idle_minutes":
-                    config["screensaver"][k] = max(1, min(120, _safe_int(config["screensaver"][k], 1)))
+                elif k == "idle_seconds":
+                    config["screensaver"][k] = max(5, min(7200, _safe_int(config["screensaver"][k], 60)))
+            if "mouse_highlight" not in config:
+                config["mouse_highlight"] = False
             return config
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(default_config, f, indent=4)
@@ -116,14 +194,26 @@ def save_custom_messages(messages):
     except Exception as e:
         print(f"Could not save messages: {e}")
 
-def save_screensaver(enabled, idle_minutes):
+def save_mouse_highlight(enabled):
+    """Save mouse highlight option to config."""
+    try:
+        config = load_config()
+        config["mouse_highlight"] = bool(enabled)
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4)
+        return config
+    except Exception as e:
+        print(f"Could not save mouse_highlight: {e}")
+        return load_config()
+
+def save_screensaver(enabled, idle_seconds):
     """Save screensaver settings to config."""
     try:
         config = load_config()
         if "screensaver" not in config:
             config["screensaver"] = {}
         config["screensaver"]["enabled"] = bool(enabled)
-        config["screensaver"]["idle_minutes"] = max(1, min(120, int(idle_minutes)))
+        config["screensaver"]["idle_seconds"] = max(5, min(7200, int(idle_seconds)))
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4)
         return config
@@ -235,19 +325,24 @@ class MatrixRainWidget(QWidget):
         self.init_ui()
         self.init_matrix()
         
-        # Timer for animation
+        # Timer for animation (started in showEvent so we don't run when hidden in screensaver mode)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_animation)
-        fps = self.config.get("animation", {}).get("fps", 30)
-        interval = int(1000 / fps)
-        self.timer.start(interval)
-        # Screensaver: check idle periodically
+        self._animation_interval = int(1000 / (self.config.get("animation", {}).get("fps", 30)))
+        # Screensaver: check idle periodically; when active, check often for activity to dismiss
+        # Timer parented to app so it runs even when widget was never shown (screensaver-only start)
         self._screensaver_active = False
-        self._idle_check_timer = QTimer()
+        app = QApplication.instance()
+        self._idle_check_timer = QTimer(app if app else self)
         self._idle_check_timer.timeout.connect(self._check_screensaver_idle)
-        self._idle_check_timer.start(10000)  # Check every 10 seconds
+        self._idle_check_timer.start(5000)  # Check every 5 seconds to show
+        QTimer.singleShot(2000, self._check_screensaver_idle)  # First check after 2 s
+        self._screensaver_dismiss_timer = QTimer()
+        self._screensaver_dismiss_timer.timeout.connect(self._check_screensaver_dismiss)
+        self._screensaver_dismiss_timer.setInterval(200)  # When active, check every 200ms for activity
         # System tray (must be after widget is created)
         self.create_tray_icon()
+        self.setMouseTracking(self.config.get("mouse_highlight", False))
     
     def init_ui(self):
         """Initialize the UI"""
@@ -354,7 +449,9 @@ class MatrixRainWidget(QWidget):
         except Exception:
             return
         try:
-            bottom_fade_zone = max(60, height // 8)  # Pixels from bottom where fade starts
+            bottom_fade_zone = max(60, height // 8)
+            mouse_highlight = self.config.get("mouse_highlight", False)
+            cursor_pos = self.mapFromGlobal(QCursor.pos()) if mouse_highlight else None
             for col in columns:
                 if not getattr(col, "chars", None) or col.length <= 0:
                     continue
@@ -367,13 +464,20 @@ class MatrixRainWidget(QWidget):
                 for i, char in enumerate(col.chars):
                     y = col.y + (i * self.char_height)
                     if -self.char_height <= y <= height:
-                        # Steps behind the white head (0 = at head, 1+ = trail that fades after white passed)
                         steps_behind = (head_index - i) % L
-                        # Smooth fade at bottom of screen so lines don't cut off
                         bottom_fade = 1.0
                         if y > height - bottom_fade_zone:
                             bottom_fade = max(0.0, (height - y) / bottom_fade_zone)
-                        # Same white-shine animation for both regular and custom message columns
+                        # Mouse highlight: character under cursor glows
+                        under_cursor = False
+                        if cursor_pos is not None:
+                            cx, cy = cursor_pos.x(), cursor_pos.y()
+                            if col.x <= cx < col.x + self.char_width and int(y) - self.char_height <= cy <= int(y):
+                                under_cursor = True
+                        if under_cursor:
+                            painter.setPen(QColor(255, 255, 255, 255))
+                            painter.drawText(col.x, int(y), char)
+                            continue
                         if steps_behind == 0:
                             # White shine here (moves down the column over time)
                             glow_cfg = self.config.get("glow") or {}
@@ -411,6 +515,14 @@ class MatrixRainWidget(QWidget):
     def update_animation(self):
         """Update animation frame"""
         try:
+            # When screensaver is on, check every frame for activity so we dismiss immediately
+            if getattr(self, "_screensaver_active", False) and sys.platform == "win32":
+                try:
+                    if get_idle_time_ms() < 2500:
+                        self._dismiss_screensaver()
+                        self._screensaver_dismiss_timer.stop()
+                except Exception:
+                    pass
             height = self.height()
             columns = getattr(self, "columns", [])
             for col in columns:
@@ -432,32 +544,55 @@ class MatrixRainWidget(QWidget):
             pass
     
     def _check_screensaver_idle(self):
-        """If screensaver enabled and idle long enough, show fullscreen (screensaver on)."""
+        """If screensaver enabled: show when idle long enough; hide when activity detected."""
+        try:
+            idle_ms = get_idle_time_ms()
+        except Exception:
+            idle_ms = 0
+        # When screensaver is showing, any recent activity (low idle) should stop it
         if getattr(self, "_screensaver_active", False):
+            if sys.platform == "win32" and idle_ms < 2500:  # Activity in last 2.5 sec
+                self._dismiss_screensaver()
             return
         cfg = self.config.get("screensaver") or {}
         if not cfg.get("enabled"):
             return
         if self.isVisible():
             return
-        idle_minutes = max(1, min(120, _safe_int(cfg.get("idle_minutes"), 1)))
-        threshold_ms = idle_minutes * 60 * 1000
-        try:
-            idle_ms = get_idle_time_ms()
-        except Exception:
-            idle_ms = 0
+        idle_seconds = max(5, min(7200, _safe_int(cfg.get("idle_seconds"), 60)))
+        threshold_ms = idle_seconds * 1000
         if sys.platform != "win32" and idle_ms == 0:
-            return  # Idle detection only on Windows
+            return
         if idle_ms >= threshold_ms:
             self._screensaver_active = True
+            self._screensaver_dismiss_timer.start()
+            # Global hooks: any key or mouse activity anywhere will dismiss
+            _install_screensaver_keyboard_hook(self)
+            _install_screensaver_mouse_hook(self)
             self.showFullScreen()
             self.raise_()
             self.activateWindow()
+
+    def _check_screensaver_dismiss(self):
+        """When screensaver is on, detect activity via idle time and stop displaying."""
+        if not getattr(self, "_screensaver_active", False):
+            self._screensaver_dismiss_timer.stop()
+            return
+        try:
+            idle_ms = get_idle_time_ms()
+        except Exception:
+            return
+        if sys.platform == "win32" and idle_ms < 2500:
+            self._dismiss_screensaver()
+            self._screensaver_dismiss_timer.stop()
 
     def _dismiss_screensaver(self):
         """Hide window and clear screensaver state on user input."""
         if getattr(self, "_screensaver_active", False):
             self._screensaver_active = False
+            self._screensaver_dismiss_timer.stop()
+            _uninstall_screensaver_keyboard_hook()
+            _uninstall_screensaver_mouse_hook()
             self.hide()
 
     def mousePressEvent(self, event):
@@ -474,6 +609,8 @@ class MatrixRainWidget(QWidget):
             self._dismiss_screensaver()
             event.accept()
             return
+        if self.config.get("mouse_highlight", False):
+            self.update()  # Repaint so highlight follows cursor
         if event.buttons() == Qt.LeftButton:
             self.move(event.globalPos() - self.drag_position)
             event.accept()
@@ -491,6 +628,17 @@ class MatrixRainWidget(QWidget):
             else:
                 self.showFullScreen()
                 self.init_matrix()
+
+    def showEvent(self, event):
+        """Start animation when window is shown."""
+        super().showEvent(event)
+        if not self.timer.isActive():
+            self.timer.start(self._animation_interval)
+
+    def hideEvent(self, event):
+        """Stop animation when hidden to save CPU and keep idle-check timer responsive."""
+        super().hideEvent(event)
+        self.timer.stop()
 
     def closeEvent(self, event):
         """Hide to system tray instead of quitting."""
@@ -554,6 +702,11 @@ class MatrixRainWidget(QWidget):
         screensaver_action = QAction("Screensaver...", self)
         screensaver_action.triggered.connect(self.show_screensaver_dialog)
         menu.addAction(screensaver_action)
+        self.mouse_highlight_action = QAction("Mouse highlight", self)
+        self.mouse_highlight_action.setCheckable(True)
+        self.mouse_highlight_action.setChecked(bool(self.config.get("mouse_highlight", False)))
+        self.mouse_highlight_action.triggered.connect(self.toggle_mouse_highlight)
+        menu.addAction(self.mouse_highlight_action)
         menu.addSeparator()
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.quit_app)
@@ -610,15 +763,24 @@ class MatrixRainWidget(QWidget):
             s, r = dlg.get_glow()
             self.config = save_glow(s, r)
 
+    def toggle_mouse_highlight(self):
+        """Toggle mouse highlight and save; update tracking and menu."""
+        new_val = not self.config.get("mouse_highlight", False)
+        self.config = save_mouse_highlight(new_val)
+        self.setMouseTracking(new_val)
+        if hasattr(self, "mouse_highlight_action"):
+            self.mouse_highlight_action.setChecked(new_val)
+        self.update()
+
     def show_screensaver_dialog(self):
         """Show screensaver enable and idle timeout dialog."""
         cfg = self.config.get("screensaver") or {}
         enabled = bool(cfg.get("enabled", False))
-        idle_minutes = max(1, min(120, _safe_int(cfg.get("idle_minutes"), 1)))
-        dlg = ScreensaverDialog(enabled, idle_minutes, self)
+        idle_seconds = max(5, min(7200, _safe_int(cfg.get("idle_seconds"), 60)))
+        dlg = ScreensaverDialog(enabled, idle_seconds, self)
         if dlg.exec_() == QDialog.Accepted:
-            en, mins = dlg.get_values()
-            self.config = save_screensaver(en, mins)
+            en, secs = dlg.get_values()
+            self.config = save_screensaver(en, secs)
 
     def quit_app(self):
         self.tray_icon.hide()
@@ -715,8 +877,8 @@ class GlowDialog(QDialog):
 
 
 class ScreensaverDialog(QDialog):
-    """Dialog to enable screensaver and set idle timeout."""
-    def __init__(self, enabled, idle_minutes, parent=None):
+    """Dialog to enable screensaver and set idle timeout (in seconds)."""
+    def __init__(self, enabled, idle_seconds, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Screensaver")
         layout = QFormLayout(self)
@@ -724,12 +886,12 @@ class ScreensaverDialog(QDialog):
         self.enabled_check.setChecked(bool(enabled))
         layout.addRow("", self.enabled_check)
         self.idle_spin = QDoubleSpinBox()
-        self.idle_spin.setRange(1, 120)
-        self.idle_spin.setValue(max(1, min(120, int(idle_minutes))))
+        self.idle_spin.setRange(5, 7200)  # 5 sec to 2 hours
+        self.idle_spin.setValue(max(5, min(7200, int(idle_seconds))))
         self.idle_spin.setDecimals(0)
-        self.idle_spin.setSuffix(" min")
+        self.idle_spin.setSuffix(" sec")
         layout.addRow("Turn on after (no mouse/keyboard):", self.idle_spin)
-        layout.addRow(QLabel("(Windows: uses system idle time. Any key or mouse move dismisses.)"))
+        layout.addRow(QLabel("(e.g. 5 for testing, 60 for 1 min, 300 for 5 min. Any key or mouse dismisses.)"))
         layout.addRow(QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, accepted=self.accept, rejected=self.reject))
 
     def get_values(self):
@@ -742,7 +904,9 @@ def main():
         app = QApplication(sys.argv)
         app.setQuitOnLastWindowClosed(False)  # Keep running when hidden to tray
         widget = MatrixRainWidget()
-        widget.show()
+        # If screensaver mode is on, start hidden (tray only); overlay appears after idle timeout
+        if not (widget.config.get("screensaver") or {}).get("enabled", False):
+            widget.show()
         sys.exit(app.exec_())
     except Exception as e:
         import traceback

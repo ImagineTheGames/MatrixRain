@@ -1,12 +1,14 @@
 ---
-description: When done with Matrix Rain tasks, kill any running instance and start the app (tray only, no console)
+description: After ANY changes to Matrix Rain, terminate the running instance and start a new one (required)
 globs: "**/*.py"
 alwaysApply: false
 ---
 
-# Run Matrix Rain when done with tasks
+# Restart Matrix Rain after changes (required)
 
-Whenever you finish tasks in this project (whether or not you changed code):
+**You must terminate the running instance and start a new one every time you are done with changes on this app.**
+
+Whenever you finish making changes in this project:
 
 1. **Kill** any running Matrix Rain process (python or pythonw):
    ```powershell

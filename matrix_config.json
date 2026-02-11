@@ -25,5 +25,10 @@
     "glow": {
         "strength": 90,
         "radius": 2
-    }
+    },
+    "screensaver": {
+        "enabled": true,
+        "idle_seconds": 5
+    },
+    "mouse_highlight": true
 }
