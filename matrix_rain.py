@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Matrix Rain Effect - Windowless transparent overlay
-Displays falling ASCII characters like in The Matrix with transparent background.
-Controllable via system tray; supports custom messages in the rain.
+Matrix Screensaver - Digital rain overlay and idle screensaver
+Displays falling characters (Latin + Katakana) like in The Matrix. Controllable via system tray;
+supports custom messages, speed, glow, and optional screensaver mode (turn on after idle).
 """
 
 import sys
@@ -137,12 +137,13 @@ def load_config():
     default_config = {
         "speed": {"min": 4.0, "max": 9.0},
         "animation": {"fps": 30},
-        "column": {"min_length": 12, "max_length": 48},
+        "column": {"min_length": 24, "max_length": 120},
         "font": {"name": "Consolas", "size": 14},
         "custom_messages": [],
         "glow": {"strength": 90, "radius": 3},
         "screensaver": {"enabled": False, "idle_seconds": 60},
         "mouse_highlight": False,
+        "hue": {"shift": 0, "cycle": False},
     }
     try:
         if os.path.exists(CONFIG_PATH):
@@ -176,6 +177,13 @@ def load_config():
                     config["screensaver"][k] = max(5, min(7200, _safe_int(config["screensaver"][k], 60)))
             if "mouse_highlight" not in config:
                 config["mouse_highlight"] = False
+            if "hue" not in config or not isinstance(config.get("hue"), dict):
+                config["hue"] = {"shift": 0, "cycle": False}
+            for k, default in (("shift", 0), ("cycle", False)):
+                if k not in config["hue"]:
+                    config["hue"][k] = default
+                elif k == "shift":
+                    config["hue"][k] = max(0, min(360, _safe_int(config["hue"][k], 0)))
             return config
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(default_config, f, indent=4)
@@ -221,6 +229,21 @@ def save_screensaver(enabled, idle_seconds):
         print(f"Could not save screensaver: {e}")
         return load_config()
 
+def save_hue(hue_shift, cycle):
+    """Save hue shift (0-360) and cycle option to config."""
+    try:
+        config = load_config()
+        if "hue" not in config:
+            config["hue"] = {}
+        config["hue"]["shift"] = max(0, min(360, int(hue_shift)))
+        config["hue"]["cycle"] = bool(cycle)
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4)
+        return config
+    except Exception as e:
+        print(f"Could not save hue: {e}")
+        return load_config()
+
 def save_glow(strength, radius):
     """Save glow strength and radius to config."""
     try:
@@ -261,12 +284,14 @@ class MatrixColumn:
         self.length_min = length_min
         self.length_max = length_max
         self.speed = random.uniform(speed_min, speed_max)
-        # Some columns span full screen height (top to bottom) before fading; rest use random length
-        full_height_chars = max(length_min, int(window_height / char_height) + random.randint(10, 40))
-        if random.random() < 0.45:
-            self.length = full_height_chars
+        # Many columns span full screen (top to bottom) in one go; rest use random length with longer trails
+        full_height_chars = max(length_min, (window_height // char_height) + random.randint(5, 50))
+        if random.random() < 0.65:
+            self.length = full_height_chars  # Top to bottom in one go
         else:
-            self.length = random.randint(length_min, min(length_max, full_height_chars))
+            low = max(length_min, full_height_chars // 2)
+            high = min(length_max, full_height_chars)
+            self.length = random.randint(low, high) if low <= high else full_height_chars
         self.chars = []
         self.is_message = False
         self.head_offset = 0.0
@@ -303,12 +328,14 @@ class MatrixColumn:
             self.trail_persistence = random.uniform(0.6, 1.6)
             if self.is_message:
                 self.is_message = False
-            # ~45% of columns span full screen (top to bottom) before fading
-            full_height_chars = max(self.length_min, int(window_height / self.char_height) + random.randint(10, 40))
-            if random.random() < 0.45:
+            # ~65% of columns span full screen (top to bottom) in one go; rest get longer trails
+            full_height_chars = max(self.length_min, (window_height // self.char_height) + random.randint(5, 50))
+            if random.random() < 0.65:
                 self.length = full_height_chars
             else:
-                self.length = random.randint(self.length_min, min(self.length_max, full_height_chars))
+                low = max(self.length_min, full_height_chars // 2)
+                high = min(self.length_max, full_height_chars)
+                self.length = random.randint(low, high) if low <= high else full_height_chars
             self.generate_chars()
         elif not self.is_message and random.random() < 0.2:
             # Flicker less often: ~20% of frames, replace only one character per column
@@ -329,6 +356,7 @@ class MatrixRainWidget(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_animation)
         self._animation_interval = int(1000 / (self.config.get("animation", {}).get("fps", 30)))
+        self._hue_cycle_angle = 0.0  # Used when hue cycle is on
         # Screensaver: check idle periodically; when active, check often for activity to dismiss
         # Timer parented to app so it runs even when widget was never shown (screensaver-only start)
         self._screensaver_active = False
@@ -399,6 +427,25 @@ class MatrixRainWidget(QWidget):
         self._message_inject_counter = 0
         self._message_inject_interval = max(15, int(1.0 * (self.config.get("animation", {}).get("fps", 30))))  # ~every 1 sec so messages are visible
     
+    def _effective_hue_degrees(self):
+        """Current hue shift in degrees (config shift + cycle offset when cycling)."""
+        cfg = self.config.get("hue") or {}
+        shift = max(0, min(360, _safe_int(cfg.get("shift"), 0)))
+        if cfg.get("cycle"):
+            shift = (shift + getattr(self, "_hue_cycle_angle", 0)) % 360
+        return shift
+
+    def _apply_hue(self, color):
+        """Return a QColor with hue shifted by current hue setting; preserves alpha."""
+        r, g, b, a = color.red(), color.green(), color.blue(), color.alpha()
+        c = QColor(r, g, b)
+        h, s, v, _ = c.getHsv()
+        if s == 0 and v == 0:
+            return color
+        new_h = int((h + self._effective_hue_degrees()) % 360)
+        out = QColor.fromHsv(new_h, min(255, s), min(255, v))
+        return QColor(out.red(), out.green(), out.blue(), a)
+
     def _glow_offsets(self):
         """Return list of (dx, dy, alpha_scale) for glow layers from config (radius 1–3 = more glow)."""
         glow_cfg = self.config.get("glow") or {}
@@ -475,7 +522,7 @@ class MatrixRainWidget(QWidget):
                             if col.x <= cx < col.x + self.char_width and int(y) - self.char_height <= cy <= int(y):
                                 under_cursor = True
                         if under_cursor:
-                            painter.setPen(QColor(255, 255, 255, 255))
+                            painter.setPen(self._apply_hue(QColor(255, 255, 255, 255)))
                             painter.drawText(col.x, int(y), char)
                             continue
                         if steps_behind == 0:
@@ -487,26 +534,26 @@ class MatrixRainWidget(QWidget):
                                 for dx, dy, scale in self._glow_offsets():
                                     a_glow = max(0, min(255, int(130 * alpha_scale * scale)))
                                     if a_glow > 0:
-                                        painter.setPen(QColor(180, 255, 180, a_glow))
+                                        painter.setPen(self._apply_hue(QColor(180, 255, 180, a_glow)))
                                         painter.drawText(col.x + dx, int(y) + dy, char)
                             a = int(255 * bottom_fade)
-                            painter.setPen(QColor(255, 255, 255, a))
+                            painter.setPen(self._apply_hue(QColor(255, 255, 255, a)))
                             painter.drawText(col.x, int(y), char)
                         elif steps_behind <= 2:
-                            color = QColor(0, 255, 70, int(255 * bottom_fade))
+                            color = self._apply_hue(QColor(0, 255, 70, int(255 * bottom_fade)))
                             self._draw_char_glow(painter, col.x, y, char, color, base_glow_alpha=80)
                         elif steps_behind <= 6:
                             persistence = max(0.3, getattr(col, "trail_persistence", 1.0))
                             eff = (steps_behind - 2) / persistence  # Slower fade for high-persistence columns
                             alpha = int(220 * (1 - min(1, eff / 5)) * bottom_fade)
-                            color = QColor(0, 220, 60, max(alpha, 80))
+                            color = self._apply_hue(QColor(0, 220, 60, max(alpha, 80)))
                             self._draw_char_glow(painter, col.x, y, char, color, base_glow_alpha=40)
                         else:
                             persistence = max(0.3, getattr(col, "trail_persistence", 1.0))
                             eff_trail = (steps_behind - 6) / persistence
                             denom = max(L - 6, 1)
                             alpha = int(160 * (1 - min(1, eff_trail / denom)) * bottom_fade)
-                            color = QColor(0, 180, 55, max(alpha, 60))
+                            color = self._apply_hue(QColor(0, 180, 55, max(alpha, 60)))
                             painter.setPen(color)
                             painter.drawText(col.x, int(y), char)
         except Exception:
@@ -527,6 +574,11 @@ class MatrixRainWidget(QWidget):
             columns = getattr(self, "columns", [])
             for col in columns:
                 col.update(height)
+            messages = self.config.get("custom_messages") or []
+            # Hue cycle: advance angle when cycle is enabled
+            hue_cfg = self.config.get("hue") or {}
+            if hue_cfg.get("cycle"):
+                self._hue_cycle_angle = (getattr(self, "_hue_cycle_angle", 0) + 0.7) % 360
             messages = self.config.get("custom_messages") or []
             if messages:
                 self._message_inject_counter = getattr(self, "_message_inject_counter", 0) + 1
@@ -660,17 +712,21 @@ class MatrixRainWidget(QWidget):
 
     def create_tray_icon(self):
         """Create system tray icon with menu."""
-        # Simple green 16x16 icon
-        pix = QPixmap(16, 16)
-        pix.fill(Qt.transparent)
-        painter = QPainter(pix)
-        painter.setPen(QColor(0, 255, 0))
-        painter.setBrush(QColor(0, 180, 0))
-        painter.drawRect(2, 2, 12, 12)
-        painter.end()
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        tray_path = os.path.join(base_dir, "store", "icons", "tray_16.png")
+        if os.path.exists(tray_path):
+            pix = QPixmap(tray_path)
+        else:
+            pix = QPixmap(16, 16)
+            pix.fill(Qt.transparent)
+            painter = QPainter(pix)
+            painter.setPen(QColor(0, 255, 0))
+            painter.setBrush(QColor(0, 180, 0))
+            painter.drawRect(2, 2, 12, 12)
+            painter.end()
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(QIcon(pix))
-        self.tray_icon.setToolTip("Matrix Rain")
+        self.tray_icon.setToolTip("Matrix Screensaver")
         menu = QMenu()
         show_action = QAction("Show", self)
         show_action.triggered.connect(self.show)
@@ -699,6 +755,9 @@ class MatrixRainWidget(QWidget):
         glow_action = QAction("Glow...", self)
         glow_action.triggered.connect(self.show_glow_dialog)
         menu.addAction(glow_action)
+        hue_action = QAction("Hue...", self)
+        hue_action.triggered.connect(self.show_hue_dialog)
+        menu.addAction(hue_action)
         screensaver_action = QAction("Screensaver...", self)
         screensaver_action.triggered.connect(self.show_screensaver_dialog)
         menu.addAction(screensaver_action)
@@ -762,6 +821,17 @@ class MatrixRainWidget(QWidget):
         if dlg.exec_() == QDialog.Accepted:
             s, r = dlg.get_glow()
             self.config = save_glow(s, r)
+
+    def show_hue_dialog(self):
+        """Show hue shift and cycle dialog."""
+        cfg = self.config.get("hue") or {}
+        hue_shift = max(0, min(360, _safe_int(cfg.get("shift"), 0)))
+        cycle = bool(cfg.get("cycle", False))
+        dlg = HueDialog(hue_shift, cycle, self)
+        if dlg.exec_() == QDialog.Accepted:
+            shift, cycle_enabled = dlg.get_values()
+            self.config = save_hue(shift, cycle_enabled)
+            self.update()
 
     def toggle_mouse_highlight(self):
         """Toggle mouse highlight and save; update tracking and menu."""
@@ -876,13 +946,38 @@ class GlowDialog(QDialog):
         return self.slider.value(), int(self.radius_spin.value())
 
 
+class HueDialog(QDialog):
+    """Dialog to set hue shift (0-360) and optional cycle through hues."""
+    def __init__(self, hue_shift, cycle, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Hue")
+        layout = QFormLayout(self)
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 360)
+        self.slider.setValue(max(0, min(360, int(hue_shift))))
+        self.slider.setTickPosition(QSlider.TicksBelow)
+        self.slider.setTickInterval(60)
+        self.slider_label = QLabel(f"{int(hue_shift)}° (0=green, 120=cyan, 240=blue)")
+        self.slider.valueChanged.connect(lambda v: self.slider_label.setText(f"{v}° (0=green, 120=cyan, 240=blue)"))
+        layout.addRow("Hue:", self.slider)
+        layout.addRow("", self.slider_label)
+        self.cycle_check = QCheckBox("Cycle through all hues")
+        self.cycle_check.setChecked(bool(cycle))
+        layout.addRow("", self.cycle_check)
+        layout.addRow(QLabel("When cycling, the rain color animates through the spectrum over time."))
+        layout.addRow(QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, accepted=self.accept, rejected=self.reject))
+
+    def get_values(self):
+        return self.slider.value(), self.cycle_check.isChecked()
+
+
 class ScreensaverDialog(QDialog):
     """Dialog to enable screensaver and set idle timeout (in seconds)."""
     def __init__(self, enabled, idle_seconds, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Screensaver")
         layout = QFormLayout(self)
-        self.enabled_check = QCheckBox("Use Matrix Rain as screensaver")
+        self.enabled_check = QCheckBox("Use Matrix Screensaver as screensaver")
         self.enabled_check.setChecked(bool(enabled))
         layout.addRow("", self.enabled_check)
         self.idle_spin = QDoubleSpinBox()
