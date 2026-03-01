@@ -31,7 +31,16 @@ pip install PyQt5
 
 ## Config
 
-`matrix_config.json` — speed, animation fps, column length, font, custom_messages, glow, screensaver.
+`matrix_config.json` — speed, animation fps, column length, font, custom_messages, glow, screensaver, hue.
+
+## Build for Microsoft Store
+
+1. **Bump version** in `version.py` (see `.cursor/rules/version-and-build.mdc`).
+2. Install PyInstaller: `pip install pyinstaller`
+3. From repo root, run: `.\build\build.ps1`
+4. Output: `dist\Matrix Screensaver\` (exe + store assets). The script cleans `dist/` and `build/` before building and removes `build/` after to keep size small.
+5. **Publish via command line:** Use the [Microsoft Store Developer CLI](https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/overview-exe). See **`store/PUBLISH_CLI.md`** for install, configure (Entra ID), and: `.\build\publish-store.ps1 -ProductId "9NXXXXXXXX"`.  
+   Alternatively, package the `dist\Matrix Screensaver\` contents as MSIX (e.g. MSIX Packaging Tool or Partner Center).
 
 ## License
 

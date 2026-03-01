@@ -34,7 +34,14 @@ MATRIX_CHARS = MATRIX_LATIN + MATRIX_KATAKANA
 # Global speed scale: 0.85 = 15% slower (applied to all column movement)
 SPEED_SCALE = 0.85
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'matrix_config.json')
+def _base_dir():
+    """App root: next to the exe when frozen (PyInstaller), else script directory."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_PATH = os.path.join(_base_dir(), "matrix_config.json")
 
 # Windows low-level hooks for screensaver dismiss (any key or mouse = stop)
 _kb_hook_id = None
@@ -141,7 +148,7 @@ def load_config():
         "font": {"name": "Consolas", "size": 14},
         "custom_messages": [],
         "glow": {"strength": 90, "radius": 3},
-        "screensaver": {"enabled": False, "idle_seconds": 60},
+        "screensaver": {"enabled": True, "idle_seconds": 60},
         "mouse_highlight": False,
         "hue": {"shift": 0, "cycle": False},
     }
@@ -166,11 +173,11 @@ def load_config():
                 else:
                     config["glow"][k] = _safe_int(config["glow"][k], default)
             if "screensaver" not in config or not isinstance(config.get("screensaver"), dict):
-                config["screensaver"] = {"enabled": False, "idle_seconds": 60}
+                config["screensaver"] = {"enabled": True, "idle_seconds": 60}
             # Migrate old idle_minutes to idle_seconds
             if "idle_seconds" not in config["screensaver"] and "idle_minutes" in config["screensaver"]:
                 config["screensaver"]["idle_seconds"] = max(5, min(7200, _safe_int(config["screensaver"]["idle_minutes"], 1) * 60))
-            for k, default in (("enabled", False), ("idle_seconds", 60)):
+            for k, default in (("enabled", True), ("idle_seconds", 60)):
                 if k not in config["screensaver"]:
                     config["screensaver"][k] = default
                 elif k == "idle_seconds":
@@ -712,7 +719,7 @@ class MatrixRainWidget(QWidget):
 
     def create_tray_icon(self):
         """Create system tray icon with menu."""
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = _base_dir()
         tray_path = os.path.join(base_dir, "store", "icons", "tray_16.png")
         if os.path.exists(tray_path):
             pix = QPixmap(tray_path)
@@ -845,7 +852,7 @@ class MatrixRainWidget(QWidget):
     def show_screensaver_dialog(self):
         """Show screensaver enable and idle timeout dialog."""
         cfg = self.config.get("screensaver") or {}
-        enabled = bool(cfg.get("enabled", False))
+        enabled = bool(cfg.get("enabled", True))
         idle_seconds = max(5, min(7200, _safe_int(cfg.get("idle_seconds"), 60)))
         dlg = ScreensaverDialog(enabled, idle_seconds, self)
         if dlg.exec_() == QDialog.Accepted:
@@ -986,7 +993,7 @@ class ScreensaverDialog(QDialog):
         self.idle_spin.setDecimals(0)
         self.idle_spin.setSuffix(" sec")
         layout.addRow("Turn on after (no mouse/keyboard):", self.idle_spin)
-        layout.addRow(QLabel("(e.g. 5 for testing, 60 for 1 min, 300 for 5 min. Any key or mouse dismisses.)"))
+        layout.addRow(QLabel("Any key or mouse move dismisses the overlay."))
         layout.addRow(QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, accepted=self.accept, rejected=self.reject))
 
     def get_values(self):
@@ -1007,7 +1014,7 @@ def main():
         import traceback
         traceback.print_exc()
         try:
-            log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matrix_rain_crash.log")
+            log_path = os.path.join(_base_dir(), "matrix_rain_crash.log")
             with open(log_path, "w", encoding="utf-8") as f:
                 traceback.print_exc(file=f)
         except Exception:

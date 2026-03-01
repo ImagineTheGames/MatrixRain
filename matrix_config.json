@@ -30,5 +30,9 @@
         "enabled": true,
         "idle_seconds": 5
     },
-    "mouse_highlight": true
+    "mouse_highlight": true,
+    "hue": {
+        "shift": 0,
+        "cycle": true
+    }
 }

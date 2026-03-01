@@ -1,0 +1,26 @@
+---
+description: Version bump and build cleanup for Matrix Screensaver (releases and Microsoft Store)
+globs: ["version.py", "build/**"]
+alwaysApply: false
+---
+
+# Version and build
+
+## Version bump (required before release/store build)
+
+**Always increment the version before preparing a new release or Microsoft Store build.**
+
+- **Single source of truth:** `version.py` — update `__version__` there only (e.g. `"1.0.0"` → `"1.0.1"` or `"1.1.0"`).
+- When adding features or preparing a store submission, bump the version first, then build.
+- Use semantic-style versions: major.minor.patch (e.g. 1.2.3).
+
+## Build cleanup (keep build size small)
+
+**Builds must clean old artifacts before and after so output stays small and reproducible.**
+
+- Before running the build script:
+  - Remove `dist/` and `build/` if they exist (leftover from previous PyInstaller runs).
+  - Do not commit `dist/`, `build/`, or generated `*.spec` files; they are in `.gitignore`.
+- The build script **`build/build.ps1`** performs this cleanup automatically. Do not disable it.
+- Before running the build: **bump the version** in `version.py`, then run: `.\build\build.ps1` from the repo root.
+- After building, only the contents of **`dist/Matrix Screensaver/`** are the deliverable; `build/` is removed by the script to keep disk use small.
