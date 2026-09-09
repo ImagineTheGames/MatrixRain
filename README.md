@@ -8,6 +8,7 @@ A Matrix-style digital rain overlay for Windows: falling green characters (Latin
 - **Custom messages** — Messages appear randomly in the rain (tray: Add message / Manage messages)
 - **Speed & glow** — Adjust fall speed and glow strength/radius from the tray
 - **Screensaver mode** — Turn on after N seconds of no mouse/keyboard (5 sec–2 hours; Windows idle detection). Dismiss with any key or mouse move.
+- **Black background** — Optional opaque black backdrop while the screensaver is on, so the desktop is hidden (tray: Screensaver settings). Off by default.
 - **Full-height lines** — Some streams run from top to bottom before fading
 - **Mouse highlight** — Optional highlight of characters under the cursor
 

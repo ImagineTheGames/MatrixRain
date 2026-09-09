@@ -148,7 +148,7 @@ def load_config():
         "font": {"name": "Consolas", "size": 14},
         "custom_messages": [],
         "glow": {"strength": 90, "radius": 3},
-        "screensaver": {"enabled": True, "idle_seconds": 60},
+        "screensaver": {"enabled": True, "idle_seconds": 60, "black_background": False},
         "mouse_highlight": False,
         "hue": {"shift": 0, "cycle": False},
     }
@@ -173,15 +173,17 @@ def load_config():
                 else:
                     config["glow"][k] = _safe_int(config["glow"][k], default)
             if "screensaver" not in config or not isinstance(config.get("screensaver"), dict):
-                config["screensaver"] = {"enabled": True, "idle_seconds": 60}
+                config["screensaver"] = {"enabled": True, "idle_seconds": 60, "black_background": False}
             # Migrate old idle_minutes to idle_seconds
             if "idle_seconds" not in config["screensaver"] and "idle_minutes" in config["screensaver"]:
                 config["screensaver"]["idle_seconds"] = max(5, min(7200, _safe_int(config["screensaver"]["idle_minutes"], 1) * 60))
-            for k, default in (("enabled", True), ("idle_seconds", 60)):
+            for k, default in (("enabled", True), ("idle_seconds", 60), ("black_background", False)):
                 if k not in config["screensaver"]:
                     config["screensaver"][k] = default
                 elif k == "idle_seconds":
                     config["screensaver"][k] = max(5, min(7200, _safe_int(config["screensaver"][k], 60)))
+                elif k == "black_background":
+                    config["screensaver"][k] = bool(config["screensaver"][k])
             if "mouse_highlight" not in config:
                 config["mouse_highlight"] = False
             if "hue" not in config or not isinstance(config.get("hue"), dict):
@@ -221,14 +223,16 @@ def save_mouse_highlight(enabled):
         print(f"Could not save mouse_highlight: {e}")
         return load_config()
 
-def save_screensaver(enabled, idle_seconds):
-    """Save screensaver settings to config."""
+def save_screensaver(enabled, idle_seconds, black_background=None):
+    """Save screensaver settings to config. black_background=None keeps the current value."""
     try:
         config = load_config()
         if "screensaver" not in config:
             config["screensaver"] = {}
         config["screensaver"]["enabled"] = bool(enabled)
         config["screensaver"]["idle_seconds"] = max(5, min(7200, int(idle_seconds)))
+        if black_background is not None:
+            config["screensaver"]["black_background"] = bool(black_background)
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4)
         return config
@@ -502,6 +506,13 @@ class MatrixRainWidget(QWidget):
             columns = getattr(self, "columns", [])
         except Exception:
             return
+        # Optional opaque black backdrop while the screensaver overlay is showing
+        try:
+            screensaver_cfg = self.config.get("screensaver") or {}
+            if getattr(self, "_screensaver_active", False) and screensaver_cfg.get("black_background", False):
+                painter.fillRect(self.rect(), Qt.black)
+        except Exception:
+            pass
         try:
             bottom_fade_zone = max(60, height // 8)
             mouse_highlight = self.config.get("mouse_highlight", False)
@@ -854,10 +865,12 @@ class MatrixRainWidget(QWidget):
         cfg = self.config.get("screensaver") or {}
         enabled = bool(cfg.get("enabled", True))
         idle_seconds = max(5, min(7200, _safe_int(cfg.get("idle_seconds"), 60)))
-        dlg = ScreensaverDialog(enabled, idle_seconds, self)
+        black_bg = bool(cfg.get("black_background", False))
+        dlg = ScreensaverDialog(enabled, idle_seconds, black_bg, self)
         if dlg.exec_() == QDialog.Accepted:
-            en, secs = dlg.get_values()
-            self.config = save_screensaver(en, secs)
+            en, secs, black = dlg.get_values()
+            self.config = save_screensaver(en, secs, black)
+            self.update()
 
     def quit_app(self):
         self.tray_icon.hide()
@@ -980,7 +993,7 @@ class HueDialog(QDialog):
 
 class ScreensaverDialog(QDialog):
     """Dialog to enable screensaver and set idle timeout (in seconds)."""
-    def __init__(self, enabled, idle_seconds, parent=None):
+    def __init__(self, enabled, idle_seconds, black_background=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Screensaver")
         layout = QFormLayout(self)
@@ -993,11 +1006,15 @@ class ScreensaverDialog(QDialog):
         self.idle_spin.setDecimals(0)
         self.idle_spin.setSuffix(" sec")
         layout.addRow("Turn on after (no mouse/keyboard):", self.idle_spin)
+        self.black_bg_check = QCheckBox("Black background (hide the desktop behind the rain)")
+        self.black_bg_check.setChecked(bool(black_background))
+        layout.addRow("", self.black_bg_check)
         layout.addRow(QLabel("Any key or mouse move dismisses the overlay."))
         layout.addRow(QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, accepted=self.accept, rejected=self.reject))
 
     def get_values(self):
-        return self.enabled_check.isChecked(), int(self.idle_spin.value())
+        return (self.enabled_check.isChecked(), int(self.idle_spin.value()),
+                self.black_bg_check.isChecked())
 
 
 def main():
