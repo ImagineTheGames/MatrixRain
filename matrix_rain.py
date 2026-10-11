@@ -10,6 +10,7 @@ import random
 import string
 import json
 import os
+import time
 import ctypes
 from ctypes import wintypes
 from PyQt5.QtWidgets import (
@@ -33,6 +34,20 @@ MATRIX_CHARS = MATRIX_LATIN + MATRIX_KATAKANA
 
 # Global speed scale: 0.85 = 15% slower (applied to all column movement)
 SPEED_SCALE = 0.85
+
+# Hue cycle speed in degrees per second of wall-clock time (~17 s per full loop).
+# Derived from the clock (not frame count) so every PC with a synced clock shows the same color.
+HUE_CYCLE_DEG_PER_SEC = 21.0
+
+
+def clock_hue_angle(now=None):
+    """Hue cycle angle (0-360) for a given Unix timestamp; defaults to current time.
+
+    Uses Unix epoch (UTC), so machines in different timezones still agree.
+    """
+    if now is None:
+        now = time.time()
+    return (now * HUE_CYCLE_DEG_PER_SEC) % 360.0
 
 def _base_dir():
     """App root: next to the exe when frozen (PyInstaller), else script directory."""
@@ -367,7 +382,6 @@ class MatrixRainWidget(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_animation)
         self._animation_interval = int(1000 / (self.config.get("animation", {}).get("fps", 30)))
-        self._hue_cycle_angle = 0.0  # Used when hue cycle is on
         # Screensaver: check idle periodically; when active, check often for activity to dismiss
         # Timer parented to app so it runs even when widget was never shown (screensaver-only start)
         self._screensaver_active = False
@@ -439,11 +453,11 @@ class MatrixRainWidget(QWidget):
         self._message_inject_interval = max(15, int(1.0 * (self.config.get("animation", {}).get("fps", 30))))  # ~every 1 sec so messages are visible
     
     def _effective_hue_degrees(self):
-        """Current hue shift in degrees (config shift + cycle offset when cycling)."""
+        """Current hue shift in degrees (config shift + clock-synced cycle offset when cycling)."""
         cfg = self.config.get("hue") or {}
         shift = max(0, min(360, _safe_int(cfg.get("shift"), 0)))
         if cfg.get("cycle"):
-            shift = (shift + getattr(self, "_hue_cycle_angle", 0)) % 360
+            shift = (shift + clock_hue_angle()) % 360
         return shift
 
     def _apply_hue(self, color):
@@ -592,11 +606,7 @@ class MatrixRainWidget(QWidget):
             columns = getattr(self, "columns", [])
             for col in columns:
                 col.update(height)
-            messages = self.config.get("custom_messages") or []
-            # Hue cycle: advance angle when cycle is enabled
-            hue_cfg = self.config.get("hue") or {}
-            if hue_cfg.get("cycle"):
-                self._hue_cycle_angle = (getattr(self, "_hue_cycle_angle", 0) + 0.7) % 360
+            # Hue cycle angle is derived from the wall clock in _effective_hue_degrees (no per-frame state)
             messages = self.config.get("custom_messages") or []
             if messages:
                 self._message_inject_counter = getattr(self, "_message_inject_counter", 0) + 1
@@ -984,7 +994,8 @@ class HueDialog(QDialog):
         self.cycle_check = QCheckBox("Cycle through all hues")
         self.cycle_check.setChecked(bool(cycle))
         layout.addRow("", self.cycle_check)
-        layout.addRow(QLabel("When cycling, the rain color animates through the spectrum over time."))
+        layout.addRow(QLabel("When cycling, the rain color animates through the spectrum over time.\n"
+                             "Synced to the PC clock, so every machine shows the same color at the same moment."))
         layout.addRow(QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, accepted=self.accept, rejected=self.reject))
 
     def get_values(self):
