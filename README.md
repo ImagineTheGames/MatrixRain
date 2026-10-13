@@ -11,6 +11,7 @@ A Matrix-style digital rain overlay for Windows: falling green characters (Latin
 - **Black background** — Optional opaque black backdrop while the screensaver is on, so the desktop is hidden (tray: Screensaver settings). Off by default.
 - **Full-height lines** — Some streams run from top to bottom before fading
 - **Mouse highlight** — Optional highlight of characters under the cursor
+- **Start with Windows** — Tray toggle registers the app in the current user's Run key (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `MatrixScreensaver`). Re-written on every launch, so it keeps pointing at wherever the app lives now.
 
 ## Microsoft Store
 

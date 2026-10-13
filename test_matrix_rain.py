@@ -38,3 +38,152 @@ class ClockHueAngleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartupCommandTests(unittest.TestCase):
+    def test_frozen_runs_exe_only(self):
+        from matrix_rain import startup_command
+        self.assertEqual(startup_command(frozen=True, executable=r"C:\App\Matrix Rain.exe", base_dir=r"C:\App"),
+                         r'"C:\App\Matrix Rain.exe"')
+
+    def test_script_uses_pythonw_and_launcher(self):
+        from matrix_rain import startup_command
+        cmd = startup_command(frozen=False, executable=r"C:\Py\python.exe", base_dir=r"E:\Proj\MatrixRain")
+        self.assertEqual(cmd, r'"C:\Py\pythonw.exe" "E:\Proj\MatrixRain\run_matrix_rain.pyw"')
+
+    def test_pythonw_kept_as_is(self):
+        from matrix_rain import startup_command
+        cmd = startup_command(frozen=False, executable=r"C:\Py\pythonw.exe", base_dir=r"E:\P")
+        self.assertTrue(cmd.startswith(r'"C:\Py\pythonw.exe"'))
+
+
+class ColumnStartTests(unittest.TestCase):
+    def test_initial_columns_are_spread_across_screen(self):
+        # Steady-state placement: most columns already have glyphs on screen at frame 0,
+        # otherwise a black-background screensaver shows a blank screen for 10-30 s.
+        from matrix_rain import MatrixColumn
+        H, ch = 1440, 17
+        cols = [MatrixColumn(i * 12, H, 2.0, 5.0, 10, 30, ch) for i in range(400)]
+        visible = sum(1 for c in cols if c.y <= H and c.y + (c.length - 1) * ch >= -ch)
+        self.assertGreater(visible / len(cols), 0.9)
+        self.assertTrue(all(c.y >= -c.length * ch for c in cols))  # never above the travel range
+
+    def test_reset_still_restarts_above_screen(self):
+        from matrix_rain import MatrixColumn
+        H, ch = 1440, 17
+        col = MatrixColumn(0, H, 2.0, 5.0, 10, 30, ch)
+        col.y = H  # force bottom past the edge
+        col.update(H)
+        self.assertLessEqual(col.y, -ch)  # restarted above the top edge
+
+
+@unittest.skipUnless(__import__("sys").platform == "win32", "Windows hooks")
+class HookTests(unittest.TestCase):
+    def test_hooks_install_and_uninstall(self):
+        import matrix_rain
+
+        class Dummy:
+            def _dismiss_screensaver(self):
+                pass
+
+        matrix_rain._install_screensaver_keyboard_hook(Dummy())
+        matrix_rain._install_screensaver_mouse_hook(Dummy())
+        self.assertTrue(matrix_rain._kb_hook_id, "keyboard hook failed to install")
+        self.assertTrue(matrix_rain._mouse_hook_id, "mouse hook failed to install")
+        matrix_rain._uninstall_screensaver_keyboard_hook()
+        matrix_rain._uninstall_screensaver_mouse_hook()
+        self.assertIsNone(matrix_rain._kb_hook_id)
+        self.assertIsNone(matrix_rain._mouse_hook_id)
+
+
+class ScreensaverStateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt5.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _widget(self):
+        import matrix_rain
+        w = matrix_rain.MatrixRainWidget()
+        self.addCleanup(w.deleteLater)
+        return w
+
+    def test_external_hide_while_active_clears_state(self):
+        # Windows minimizes a fullscreen window when another app takes focus -> hideEvent.
+        # State must be cleared, otherwise overlay is left "active" but frozen.
+        w = self._widget()
+        w.show()
+        w._screensaver_active = True
+        w._screensaver_dismiss_timer.start()
+        w.hide()
+        self.assertFalse(w._screensaver_active)
+        self.assertFalse(w._screensaver_dismiss_timer.isActive())
+
+    def test_mouse_move_at_same_position_does_not_dismiss(self):
+        # Windows posts WM_MOUSEMOVE when a window appears under the cursor; it must not dismiss.
+        from PyQt5.QtCore import Qt, QPoint, QEvent
+        from PyQt5.QtGui import QMouseEvent
+        w = self._widget()
+        w._screensaver_active = True
+        w._screensaver_cursor_start = QPoint(100, 100)
+        ev = QMouseEvent(QEvent.MouseMove, QPoint(10, 10), QPoint(100, 100), Qt.NoButton, Qt.NoButton, Qt.NoModifier)
+        w.mouseMoveEvent(ev)
+        self.assertTrue(w._screensaver_active)
+        ev2 = QMouseEvent(QEvent.MouseMove, QPoint(10, 10), QPoint(140, 100), Qt.NoButton, Qt.NoButton, Qt.NoModifier)
+        w.mouseMoveEvent(ev2)
+        self.assertFalse(w._screensaver_active)
+
+
+@unittest.skipUnless(__import__("sys").platform == "win32", "Windows hooks")
+class HookCallbackTests(unittest.TestCase):
+    def test_hook_callbacks_schedule_dismiss(self):
+        # Drive the hook procedures directly (as Windows would) and check they reach _dismiss_screensaver.
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt5.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        import matrix_rain
+
+        class Stub:
+            calls = 0
+            def _dismiss_screensaver(self):
+                Stub.calls += 1
+
+        stub = Stub()
+        matrix_rain._install_screensaver_keyboard_hook(stub)
+        matrix_rain._install_screensaver_mouse_hook(stub)
+        try:
+            self.assertTrue(matrix_rain._kb_hook_id and matrix_rain._mouse_hook_id)
+            matrix_rain._kb_hook_proc(0, 0x100, 0)      # WM_KEYDOWN
+            matrix_rain._mouse_hook_proc(0, 0x200, 0)   # WM_MOUSEMOVE
+            app.processEvents()
+            self.assertEqual(Stub.calls, 2)
+        finally:
+            matrix_rain._uninstall_screensaver_keyboard_hook()
+            matrix_rain._uninstall_screensaver_mouse_hook()
+
+
+class ResizeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt5.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_columns_follow_widget_width(self):
+        # Screen size changes (Parsec virtual display, dock/undock) must not leave part of the screen without rain.
+        import matrix_rain
+        w = matrix_rain.MatrixRainWidget()
+        self.addCleanup(w.deleteLater)
+        w.show()  # resize events are only delivered to visible widgets
+        w.resize(1000, 500)
+        self.app.processEvents()
+        n_small = len(w.columns)
+        w.resize(3000, 500)
+        self.app.processEvents()
+        n_big = len(w.columns)
+        self.assertGreater(n_big, n_small * 2)
+        self.assertTrue(all(c.x < 3000 for c in w.columns))

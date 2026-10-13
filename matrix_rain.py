@@ -58,11 +58,90 @@ def _base_dir():
 
 CONFIG_PATH = os.path.join(_base_dir(), "matrix_config.json")
 
+
+# --- Start with Windows (HKCU Run key; works for the .pyw launcher and the frozen exe) ---
+STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_VALUE_NAME = "MatrixScreensaver"
+
+
+def startup_command(frozen=None, executable=None, base_dir=None):
+    """Command line Windows runs at login to start this app (tray only, no console)."""
+    frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    executable = sys.executable if executable is None else executable
+    base_dir = _base_dir() if base_dir is None else base_dir
+    if frozen:
+        return f'"{executable}"'
+    exe_dir, exe_name = os.path.split(executable)
+    if exe_name.lower() == "python.exe":
+        executable = os.path.join(exe_dir, "pythonw.exe")
+    script = os.path.join(base_dir, "run_matrix_rain.pyw")
+    return f'"{executable}" "{script}"'
+
+
+def is_startup_enabled():
+    """True if this app is registered to start with Windows."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
+            return bool(value)
+    except OSError:
+        return False
+
+
+def set_startup_enabled(enabled):
+    """Register/unregister this app in the user's Run key. Returns True on success."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, STARTUP_VALUE_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError as e:
+        print(f"Could not update startup registration: {e}")
+        return False
+
+
+def refresh_startup_registration():
+    """If start-with-Windows is on, rewrite the command so it tracks the app's current location."""
+    if is_startup_enabled():
+        set_startup_enabled(True)
+
 # Windows low-level hooks for screensaver dismiss (any key or mouse = stop)
 _kb_hook_id = None
 _kb_hook_proc = None
 _mouse_hook_id = None
 _mouse_hook_proc = None
+_user32_hooks = None
+if sys.platform == "win32":
+    _HOOKPROC = ctypes.CFUNCTYPE(wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)  # LRESULT-sized
+else:
+    _HOOKPROC = None
+
+
+def _hook_user32():
+    """user32 with 64-bit-safe prototypes for the hook API. ctypes defaults truncate HHOOK/HMODULE to 32-bit,
+    which made SetWindowsHookExW fail with ERROR_MOD_NOT_FOUND (126) and the hooks never install."""
+    global _user32_hooks
+    if _user32_hooks is None:
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.SetWindowsHookExW.restype = wintypes.HHOOK
+        u.SetWindowsHookExW.argtypes = [ctypes.c_int, _HOOKPROC, wintypes.HMODULE, wintypes.DWORD]
+        u.UnhookWindowsHookEx.restype = wintypes.BOOL
+        u.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+        u.CallNextHookEx.restype = wintypes.LPARAM
+        u.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        _user32_hooks = u
+    return _user32_hooks
 
 def get_idle_time_ms():
     """Return system idle time in milliseconds (mouse/keyboard). Windows only; other OS returns 0."""
@@ -91,16 +170,16 @@ def _install_screensaver_keyboard_hook(widget):
     try:
         WH_KEYBOARD_LL = 13
         WM_KEYDOWN, WM_SYSKEYDOWN = 0x100, 0x104
-        user32 = ctypes.windll.user32  # type: ignore
-        kernel32 = ctypes.windll.kernel32  # type: ignore
+        user32 = _hook_user32()
 
         def low_level_kb_proc(nCode, wParam, lParam):
             if nCode >= 0 and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 QTimer.singleShot(0, widget._dismiss_screensaver)
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-        _kb_hook_proc = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)(low_level_kb_proc)
-        _kb_hook_id = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_hook_proc, kernel32.GetModuleHandleW(None), 0)
+        _kb_hook_proc = _HOOKPROC(low_level_kb_proc)
+        # hMod=None is correct for low-level hooks (callback lives in this process)
+        _kb_hook_id = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _kb_hook_proc, None, 0) or None
     except Exception:
         _kb_hook_id = None
 
@@ -111,17 +190,15 @@ def _install_screensaver_mouse_hook(widget):
         return
     try:
         WH_MOUSE_LL = 14
-        WM_MOUSEMOVE = 0x0200
-        user32 = ctypes.windll.user32  # type: ignore
-        kernel32 = ctypes.windll.kernel32  # type: ignore
+        user32 = _hook_user32()
 
         def low_level_mouse_proc(nCode, wParam, lParam):
             if nCode >= 0:  # Any mouse event (move, click, etc.)
                 QTimer.singleShot(0, widget._dismiss_screensaver)
             return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-        _mouse_hook_proc = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)(low_level_mouse_proc)
-        _mouse_hook_id = user32.SetWindowsHookExW(WH_MOUSE_LL, _mouse_hook_proc, kernel32.GetModuleHandleW(None), 0)
+        _mouse_hook_proc = _HOOKPROC(low_level_mouse_proc)
+        _mouse_hook_id = user32.SetWindowsHookExW(WH_MOUSE_LL, _mouse_hook_proc, None, 0) or None
     except Exception:
         _mouse_hook_id = None
 
@@ -131,7 +208,7 @@ def _uninstall_screensaver_keyboard_hook():
     if sys.platform != "win32" or _kb_hook_id is None:
         return
     try:
-        ctypes.windll.user32.UnhookWindowsHookEx(_kb_hook_id)  # type: ignore
+        _hook_user32().UnhookWindowsHookEx(_kb_hook_id)
     except Exception:
         pass
     _kb_hook_id = None
@@ -142,7 +219,7 @@ def _uninstall_screensaver_mouse_hook():
     if sys.platform != "win32" or _mouse_hook_id is None:
         return
     try:
-        ctypes.windll.user32.UnhookWindowsHookEx(_mouse_hook_id)  # type: ignore
+        _hook_user32().UnhookWindowsHookEx(_mouse_hook_id)
     except Exception:
         pass
     _mouse_hook_id = None
@@ -323,7 +400,10 @@ class MatrixColumn:
         self.head_offset = 0.0
         self.trail_persistence = random.uniform(0.6, 1.6)
         self.generate_chars()
-        self.y = -self.length * self.char_height - random.randint(0, window_height)
+        # Place anywhere along the travel range (steady state), so the first frame already shows rain.
+        # Starting every column above the screen left a black-background screensaver blank for 10-30 s.
+        self.y = -self.length * self.char_height + random.randint(0, window_height)
+        self.head_offset = random.uniform(0, self.length)
     
     def generate_chars(self):
         """Generate random characters for this column (Matrix-style: Latin + Katakana)"""
@@ -393,6 +473,12 @@ class MatrixRainWidget(QWidget):
         self._screensaver_dismiss_timer = QTimer()
         self._screensaver_dismiss_timer.timeout.connect(self._check_screensaver_dismiss)
         self._screensaver_dismiss_timer.setInterval(200)  # When active, check every 200ms for activity
+        # Follow screen changes (resolution switch, monitor plug/unplug, virtual displays)
+        if app is not None:
+            app.primaryScreenChanged.connect(lambda *_: self._on_screen_changed())
+            screen = app.primaryScreen()
+            if screen is not None:
+                screen.geometryChanged.connect(lambda *_: self._on_screen_changed())
         # System tray (must be after widget is created)
         self.create_tray_icon()
         self.setMouseTracking(self.config.get("mouse_highlight", False))
@@ -645,10 +731,12 @@ class MatrixRainWidget(QWidget):
             return
         if idle_ms >= threshold_ms:
             self._screensaver_active = True
+            self._screensaver_cursor_start = QCursor.pos()
             self._screensaver_dismiss_timer.start()
             # Global hooks: any key or mouse activity anywhere will dismiss
             _install_screensaver_keyboard_hook(self)
             _install_screensaver_mouse_hook(self)
+            self._sync_geometry_to_screen()
             self.showFullScreen()
             self.raise_()
             self.activateWindow()
@@ -686,7 +774,10 @@ class MatrixRainWidget(QWidget):
 
     def mouseMoveEvent(self, event):
         if getattr(self, "_screensaver_active", False):
-            self._dismiss_screensaver()
+            # Windows posts a WM_MOUSEMOVE when a window appears under the cursor; only a real move counts
+            start = getattr(self, "_screensaver_cursor_start", None)
+            if start is None or (event.globalPos() - start).manhattanLength() >= 3:
+                self._dismiss_screensaver()
             event.accept()
             return
         if self.config.get("mouse_highlight", False):
@@ -709,6 +800,40 @@ class MatrixRainWidget(QWidget):
                 self.showFullScreen()
                 self.init_matrix()
 
+    def resizeEvent(self, event):
+        """Rebuild columns when the window size changes (screen resolution / monitor changes)."""
+        super().resizeEvent(event)
+        if event.oldSize() != event.size():
+            self.init_matrix()
+
+    def _on_screen_changed(self):
+        """Primary screen changed or resized: re-sync geometry; also re-listen on the new screen object."""
+        try:
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                try:
+                    screen.geometryChanged.disconnect()
+                except TypeError:
+                    pass
+                screen.geometryChanged.connect(lambda *_: self._on_screen_changed())
+        except Exception:
+            pass
+        if self.isVisible():
+            self._sync_geometry_to_screen()
+            if self.isFullScreen():
+                self.showFullScreen()
+
+    def _sync_geometry_to_screen(self):
+        """Match the primary screen; the screen can change size while we are hidden in the tray."""
+        try:
+            screen = QApplication.primaryScreen()
+            if screen is not None and self.geometry() != screen.geometry():
+                self.setGeometry(screen.geometry())
+                if not self.isVisible():
+                    self.init_matrix()  # resizeEvent is not delivered while hidden
+        except Exception:
+            pass
+
     def showEvent(self, event):
         """Start animation when window is shown."""
         super().showEvent(event)
@@ -716,9 +841,13 @@ class MatrixRainWidget(QWidget):
             self.timer.start(self._animation_interval)
 
     def hideEvent(self, event):
-        """Stop animation when hidden to save CPU and keep idle-check timer responsive."""
+        """Stop animation when hidden to save CPU and keep idle-check timer responsive.
+        Windows minimizes a fullscreen window when another app takes focus; if that happens while the
+        screensaver is active, clear its state so it is not left 'active' but frozen."""
         super().hideEvent(event)
         self.timer.stop()
+        if getattr(self, "_screensaver_active", False):
+            self._dismiss_screensaver()
 
     def closeEvent(self, event):
         """Hide to system tray instead of quitting."""
@@ -757,7 +886,7 @@ class MatrixRainWidget(QWidget):
         self.tray_icon.setToolTip("Matrix Screensaver")
         menu = QMenu()
         show_action = QAction("Show", self)
-        show_action.triggered.connect(self.show)
+        show_action.triggered.connect(self._show_on_screen)
         menu.addAction(show_action)
         hide_action = QAction("Hide", self)
         hide_action.triggered.connect(self.hide)
@@ -794,6 +923,12 @@ class MatrixRainWidget(QWidget):
         self.mouse_highlight_action.setChecked(bool(self.config.get("mouse_highlight", False)))
         self.mouse_highlight_action.triggered.connect(self.toggle_mouse_highlight)
         menu.addAction(self.mouse_highlight_action)
+        self.startup_action = QAction("Start with Windows", self)
+        self.startup_action.setCheckable(True)
+        self.startup_action.setChecked(is_startup_enabled())
+        self.startup_action.setEnabled(sys.platform == "win32")
+        self.startup_action.triggered.connect(self.toggle_startup)
+        menu.addAction(self.startup_action)
         menu.addSeparator()
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.quit_app)
@@ -803,12 +938,16 @@ class MatrixRainWidget(QWidget):
         self.tray_icon.show()
         return self.tray_icon
 
+    def _show_on_screen(self):
+        self._sync_geometry_to_screen()
+        self.show()
+
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
             if self.isVisible():
                 self.hide()
             else:
-                self.show()
+                self._show_on_screen()
 
     def add_custom_message(self):
         text, ok = QInputDialog.getText(self, "Add message", "Message to show in the rain:")
@@ -869,6 +1008,13 @@ class MatrixRainWidget(QWidget):
         if hasattr(self, "mouse_highlight_action"):
             self.mouse_highlight_action.setChecked(new_val)
         self.update()
+
+    def toggle_startup(self, checked):
+        """Register or unregister the app to start with Windows; revert the menu check on failure."""
+        if not set_startup_enabled(checked):
+            self.startup_action.setChecked(is_startup_enabled())
+            QMessageBox.warning(self, "Start with Windows",
+                                "Could not update the Windows startup setting.")
 
     def show_screensaver_dialog(self):
         """Show screensaver enable and idle timeout dialog."""
@@ -1033,6 +1179,7 @@ def main():
     try:
         app = QApplication(sys.argv)
         app.setQuitOnLastWindowClosed(False)  # Keep running when hidden to tray
+        refresh_startup_registration()  # Keep the startup entry pointing at this copy of the app
         widget = MatrixRainWidget()
         # If screensaver mode is on, start hidden (tray only); overlay appears after idle timeout
         if not (widget.config.get("screensaver") or {}).get("enabled", False):
