@@ -68,6 +68,21 @@ class ColumnStartTests(unittest.TestCase):
         self.assertGreater(visible / len(cols), 0.9)
         self.assertTrue(all(c.y >= -c.length * ch for c in cols))  # never above the travel range
 
+    def test_motion_scales_with_elapsed_steps(self):
+        # Movement is time-based: one update of 2 steps equals two updates of 1 step (frame-rate independent).
+        import random
+        from matrix_rain import MatrixColumn
+        random.seed(5)
+        one = MatrixColumn(0, 4000, 3.0, 3.0, 10, 30, 19)
+        random.seed(5)
+        two = MatrixColumn(0, 4000, 3.0, 3.0, 10, 30, 19)
+        y0, h0 = one.y, one.head_offset
+        one.update(4000, 2.0)
+        two.update(4000, 1.0)
+        two.update(4000, 1.0)
+        self.assertAlmostEqual(one.y - y0, two.y - y0)
+        self.assertAlmostEqual(one.head_offset - h0, two.head_offset - h0)
+
     def test_reset_still_restarts_above_screen(self):
         from matrix_rain import MatrixColumn
         H, ch = 1440, 17
@@ -135,6 +150,45 @@ class ScreensaverStateTests(unittest.TestCase):
         w.mouseMoveEvent(ev2)
         self.assertFalse(w._screensaver_active)
 
+    def test_black_background_uses_solid_window(self):
+        # Black-background screensaver draws in an opaque window (cheaper than the per-pixel-alpha overlay).
+        import matrix_rain
+        w = self._widget()
+        w.config["screensaver"] = {"enabled": True, "idle_seconds": 5, "black_background": True}
+        orig_idle = matrix_rain.get_idle_time_ms
+        matrix_rain.get_idle_time_ms = lambda: 60000
+        try:
+            w._check_screensaver_idle()
+        finally:
+            matrix_rain.get_idle_time_ms = orig_idle
+        self.assertTrue(w._screensaver_active)
+        self.assertTrue(w._solid_saver.isVisible())
+        self.assertFalse(w.isVisible())
+        self.assertTrue(w.timer.isActive())
+        w._solid_saver.hide()  # e.g. Windows minimised it
+        self.assertFalse(w._screensaver_active)
+        self.assertFalse(w.timer.isActive())
+
+    def test_fallback_to_cpu_window_keeps_screensaver_up(self):
+        # If the GPU window fails to initialise, its replacement takes over without ending the screensaver.
+        import matrix_rain
+        w = self._widget()
+        w.config["screensaver"] = {"enabled": True, "idle_seconds": 5, "black_background": True}
+        orig_idle = matrix_rain.get_idle_time_ms
+        matrix_rain.get_idle_time_ms = lambda: 60000
+        try:
+            w._check_screensaver_idle()
+            old = w._solid_saver
+            w._use_cpu_screensaver()
+        finally:
+            matrix_rain.get_idle_time_ms = orig_idle
+        self.assertIsNot(w._solid_saver, old)
+        self.assertIsInstance(w._solid_saver, matrix_rain.SolidScreensaverWindow)
+        self.assertTrue(w._solid_saver.isVisible())
+        self.assertFalse(old.isVisible())
+        self.assertTrue(w._screensaver_active)
+        w._dismiss_screensaver()
+
 
 @unittest.skipUnless(__import__("sys").platform == "win32", "Windows hooks")
 class HookCallbackTests(unittest.TestCase):
@@ -187,3 +241,48 @@ class ResizeTests(unittest.TestCase):
         n_big = len(w.columns)
         self.assertGreater(n_big, n_small * 2)
         self.assertTrue(all(c.x < 3000 for c in w.columns))
+
+
+class GlyphAtlasTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt5.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _atlas(self):
+        from PyQt5.QtGui import QFont
+        import matrix_rain
+        return matrix_rain.GlyphAtlas(QFont("Consolas", 14, QFont.Bold))
+
+    def test_hue_shift_keeps_white_and_rotates_green(self):
+        from matrix_rain import hue_shift_rgb
+        self.assertEqual(hue_shift_rgb((255, 255, 255), 200), (255, 255, 255))
+        self.assertEqual(hue_shift_rgb((0, 255, 70), 360), hue_shift_rgb((0, 255, 70), 0))
+        r, g, b = hue_shift_rgb((0, 255, 70), 120)  # green -> blue side
+        self.assertGreater(b, g)
+
+    def test_tiers_are_tinted_with_hue(self):
+        # Tier sprites must carry the tier colour (hue-shifted), not the white mask colour.
+        # The mask is painted by hand: the offscreen test platform has no fonts to rasterise.
+        from PyQt5.QtGui import QPainter, QColor
+        from matrix_rain import hue_shift_rgb
+        atlas = self._atlas()
+        sx, sy = atlas.slots["M"][:2]
+        p = QPainter(atlas.core)
+        p.fillRect(sx + 8, sy + 8, 4, 4, QColor(255, 255, 255))
+        p.end()
+        for hue in (0, 200):
+            atlas.prepare(90, 2, hue)
+            c = atlas.images["near"].pixelColor(sx + 9, sy + 9)
+            self.assertEqual((c.red(), c.green(), c.blue(), c.alpha()), hue_shift_rgb((0, 220, 60), hue) + (255,))
+            glow = atlas.images["head_glow"].pixelColor(sx + 7, sy + 9)  # 1 px left of the mask: glow ring
+            self.assertGreater(glow.alpha(), 0)
+
+    def test_message_chars_get_slots(self):
+        atlas = self._atlas()
+        self.assertNotIn(" ", atlas.slots)
+        atlas.add_chars("ola mundo")
+        self.assertIn(" ", atlas.slots)
+        self.assertIn("M", atlas.slots)  # existing glyphs survive the rebuild

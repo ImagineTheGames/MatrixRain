@@ -11,7 +11,9 @@ import string
 import json
 import os
 import time
+import math
 import ctypes
+from array import array
 from ctypes import wintypes
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QMenu, QAction,
@@ -20,7 +22,12 @@ from PyQt5.QtWidgets import (
     QDoubleSpinBox, QLabel, QFormLayout, QSlider, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QTimer, QPoint
-from PyQt5.QtGui import QPainter, QColor, QFont, QFontMetrics, QIcon, QPixmap, QCursor
+from PyQt5.QtGui import (
+    QPainter, QColor, QFont, QFontMetrics, QIcon, QPixmap, QCursor, QImage,
+    QOpenGLWindow, QOpenGLContext, QOffscreenSurface, QSurfaceFormat, QOpenGLVersionProfile,
+    QOpenGLShaderProgram, QOpenGLShader, QOpenGLVertexArrayObject, QOpenGLTexture,
+)
+from PyQt5 import sip
 
 # Matrix-style character set: Latin, digits, symbols + Katakana (classic Matrix look)
 MATRIX_LATIN = string.ascii_letters + string.digits + "!@#$%^&*()_+-=[]{}|;:,.<>?"
@@ -34,6 +41,11 @@ MATRIX_CHARS = MATRIX_LATIN + MATRIX_KATAKANA
 
 # Global speed scale: 0.85 = 15% slower (applied to all column movement)
 SPEED_SCALE = 0.85
+
+# Speeds, flicker and message timing are tuned per animation step, and are applied per second at this
+# many steps per second, so the rain moves the same at any frame rate. 64/3 is the rate a 33 ms
+# QTimer actually ticked at on Windows (15.6 ms timer granularity), i.e. the look the settings were tuned with.
+ANIMATION_STEPS_PER_SEC = 64 / 3
 
 # Hue cycle speed in degrees per second of wall-clock time (~17 s per full loop).
 # Derived from the clock (not frame count) so every PC with a synced clock shows the same color.
@@ -396,6 +408,9 @@ class MatrixColumn:
             high = min(length_max, full_height_chars)
             self.length = random.randint(low, high) if low <= high else full_height_chars
         self.chars = []
+        # Bumped on every change to chars; last_flicker = (version, index) lets the GPU renderer patch one cell
+        self.chars_version = 0
+        self.last_flicker = None
         self.is_message = False
         self.head_offset = 0.0
         self.trail_persistence = random.uniform(0.6, 1.6)
@@ -408,23 +423,26 @@ class MatrixColumn:
     def generate_chars(self):
         """Generate random characters for this column (Matrix-style: Latin + Katakana)"""
         self.chars = [random.choice(MATRIX_CHARS) for _ in range(self.length)]
-    
+        self.chars_version += 1
+
     def set_message(self, text):
         """Display a custom message in this column (one char per position). White shine will animate top to bottom."""
         if not text:
             return
         self.chars = list(str(text))
+        self.chars_version += 1
         self.length = len(self.chars)
         self.is_message = True
         self.head_offset = 0.0  # Start white at top of message so it animates down
         self.y = -self.length * self.char_height  # Start above top so message falls in from top
     
-    def update(self, window_height):
-        """Update column position; advance white shine down the column; flicker trail chars."""
-        self.y += self.speed * SPEED_SCALE
+    def update(self, window_height, steps=1.0):
+        """Advance by steps animation steps (fractional; see ANIMATION_STEPS_PER_SEC): move the column,
+        move the white shine down it, flicker trail chars."""
+        self.y += self.speed * SPEED_SCALE * steps
         # Advance white shine down through the column (so it "falls" over the letters)
         try:
-            self.head_offset = (getattr(self, "head_offset", 0) + self.speed * 0.35 * SPEED_SCALE) % 1e6
+            self.head_offset = (getattr(self, "head_offset", 0) + self.speed * 0.35 * SPEED_SCALE * steps) % 1e6
         except (TypeError, ValueError):
             self.head_offset = 0
         if self.y + self.length * self.char_height > window_height:
@@ -443,11 +461,145 @@ class MatrixColumn:
                 high = min(self.length_max, full_height_chars)
                 self.length = random.randint(low, high) if low <= high else full_height_chars
             self.generate_chars()
-        elif not self.is_message and random.random() < 0.2:
-            # Flicker less often: ~20% of frames, replace only one character per column
+        elif not self.is_message and random.random() < 0.2 * steps:
+            # Flicker less often: ~20% of steps, replace only one character per column
             if self.length > 0:
                 idx = random.randint(0, self.length - 1)
                 self.chars[idx] = random.choice(MATRIX_CHARS)
+                self.chars_version += 1
+                self.last_flicker = (self.chars_version, idx)
+
+def hue_shift_rgb(rgb, hue_degrees):
+    """(r, g, b) with its HSV hue rotated by hue_degrees; greys (incl. white) are unchanged."""
+    h, s, v, _ = QColor(*rgb).getHsv()
+    if s == 0 or h < 0:
+        return tuple(rgb)
+    out = QColor.fromHsv(int((h + hue_degrees) % 360), s, v)
+    return (out.red(), out.green(), out.blue())
+
+
+class GlyphAtlas:
+    """Pre-rendered glyph sprites so painting is one blit per character instead of text shaping.
+
+    drawText re-shapes its string on every call and the glow drew each glyph up to 25 times, which
+    capped the rain at ~7 fps on one full core. Here every glyph is rasterised once in white into a
+    "core" atlas; glow atlases are built from it with shifted, faded copies (the same layers the old
+    per-frame glow drew), and each colour tier is the white mask tinted with CompositionMode_SourceIn.
+    Hue changes only re-tint a handful of small images.
+    """
+    PAD = 6  # room for the 3 px glow plus glyph side bearings
+    CORE_INSET = 4  # glyph ink stays within PAD - 4 px of the cell box; core-only sprites skip that margin
+    COLS = 32
+    GLOW_SCALE_BY_D = {1: 1.0, 2: 0.55, 3: 0.3}
+    # Colour tiers: name -> (mask, base rgb). Head core is plain white, which no hue shift changes.
+    TIERS = {
+        "head_glow": ("glow130", (180, 255, 180)),
+        "head2": ("t2", (0, 255, 70)),
+        "near_glow": ("glow40", (0, 220, 60)),
+        "near": ("core", (0, 220, 60)),
+        "trail": ("core", (0, 180, 55)),
+    }
+
+    def __init__(self, font):
+        self.font = font
+        fm = QFontMetrics(font)
+        self.ascent = fm.ascent()
+        self.cell_h = fm.height() + 2 * self.PAD
+        self.cell_w = max(fm.width(c) for c in MATRIX_CHARS) + 2 * self.PAD
+        self._fm = fm
+        self.slots = {}
+        self._chars = []
+        self.core = None
+        self.images = {}
+        self._glow_key = None
+        self._hue = None
+        self.add_chars(MATRIX_CHARS)
+
+    def add_chars(self, chars):
+        """Register characters (e.g. from a custom message); new ones are rasterised immediately."""
+        new = [c for c in dict.fromkeys(chars) if c not in self.slots]
+        if not new:
+            return
+        widest = max(self._fm.width(c) for c in new) + 2 * self.PAD
+        if widest > self.cell_w:
+            self.cell_w = widest
+        self._chars.extend(new)
+        self._rebuild_core()
+
+    def _rebuild_core(self):
+        rows = (len(self._chars) + self.COLS - 1) // self.COLS
+        self.core = QImage(self.COLS * self.cell_w, rows * self.cell_h, QImage.Format_ARGB32_Premultiplied)
+        self.core.fill(Qt.transparent)
+        p = QPainter(self.core)
+        p.setFont(self.font)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setPen(QColor(255, 255, 255))
+        self.slots = {}
+        for n, ch in enumerate(self._chars):
+            sx, sy = (n % self.COLS) * self.cell_w, (n // self.COLS) * self.cell_h
+            self.slots[ch] = (sx, sy)
+            p.setClipRect(sx, sy, self.cell_w, self.cell_h)
+            p.drawText(sx + self.PAD, sy + self.PAD + self.ascent, ch)
+        p.end()
+        self.trim()  # glow and tinted images derive from core
+
+    def trim(self):
+        """Drop the derived glow and tinted images; prepare() rebuilds them when the rain is drawn again."""
+        self._masks = {}
+        self.images = {}
+        self._glow_key = None
+        self._hue = None
+
+    def _glow_mask(self, base_alpha, strength, radius, with_core=False):
+        """White mask of the glow rings (alpha = base * strength * ring scale), optionally with the core on top."""
+        img = QImage(self.core.size(), QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QPainter(img)
+        for d in range(1, radius + 1):
+            alpha = max(0, min(255, int(base_alpha * strength / 100.0 * self.GLOW_SCALE_BY_D[d])))
+            if alpha <= 0:
+                continue
+            p.setOpacity(alpha / 255.0)
+            for dx, dy in ((-d, -d), (-d, 0), (-d, d), (0, -d), (0, d), (d, -d), (d, 0), (d, d)):
+                p.drawImage(dx, dy, self.core)
+        if with_core:
+            p.setOpacity(1.0)
+            p.drawImage(0, 0, self.core)
+        p.end()
+        return img
+
+    def masks(self, strength, radius):
+        """White masks: glyph cores plus glow rings for these glow settings (a new dict whenever rebuilt)."""
+        glow_key = (strength, radius)
+        if glow_key != self._glow_key:
+            self._masks = {
+                "core": self.core,
+                "glow130": self._glow_mask(130, strength, radius),
+                "glow40": self._glow_mask(40, strength, radius),
+                "t2": self._glow_mask(80, strength, radius, with_core=True),
+            }
+            self._glow_key = glow_key
+            self._hue = None
+        return self._masks
+
+    def prepare(self, strength, radius, hue_degrees):
+        """Rebuild glow masks if glow settings changed and re-tint if the (integer) hue changed."""
+        self.masks(strength, radius)
+        hue = int(hue_degrees) % 360
+        if hue == self._hue:
+            return
+        images = {"head_core": self.core}
+        for name, (mask, rgb) in self.TIERS.items():
+            img = self._masks[mask].copy()
+            p = QPainter(img)
+            p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            p.fillRect(img.rect(), QColor(*hue_shift_rgb(rgb, hue)))
+            p.end()
+            images[name] = img
+        self.images = images
+        self._hue = hue
+
 
 class MatrixRainWidget(QWidget):
     """Main widget for Matrix rain effect"""
@@ -457,7 +609,11 @@ class MatrixRainWidget(QWidget):
         self.config = load_config()
         self.init_ui()
         self.init_matrix()
-        
+        # Black-background screensaver window; swapped for the GPU-drawn one on first use (see
+        # _check_screensaver_idle) so the OpenGL driver is not loaded while the app just sits in the tray
+        self._solid_saver = SolidScreensaverWindow(self)
+        self._try_gpu_saver = True
+
         # Timer for animation (started in showEvent so we don't run when hidden in screensaver mode)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_animation)
@@ -517,6 +673,8 @@ class MatrixRainWidget(QWidget):
         self.font_metrics = QFontMetrics(self.font)
         self.char_height = max(1, self.font_metrics.height())
         self.char_width = max(1, self.font_metrics.width('A'), self.font_metrics.width('ｱ'))
+        self.atlas = GlyphAtlas(self.font)
+        self.atlas.add_chars("".join(str(m) for m in self.config.get("custom_messages") or []))
     
     def init_matrix(self):
         """Initialize matrix columns (spaced for distinct streams like the movie)"""
@@ -531,6 +689,7 @@ class MatrixRainWidget(QWidget):
         length_min = self.config.get("column", {}).get("min_length", 10)
         length_max = self.config.get("column", {}).get("max_length", 30)
         
+        self.col_spacing = col_spacing
         for i in range(num_columns):
             x = i * col_spacing
             self.columns.append(MatrixColumn(x, height, speed_min, speed_max, length_min, length_max, self.char_height))
@@ -546,54 +705,12 @@ class MatrixRainWidget(QWidget):
             shift = (shift + clock_hue_angle()) % 360
         return shift
 
-    def _apply_hue(self, color):
-        """Return a QColor with hue shifted by current hue setting; preserves alpha."""
-        r, g, b, a = color.red(), color.green(), color.blue(), color.alpha()
-        c = QColor(r, g, b)
-        h, s, v, _ = c.getHsv()
-        if s == 0 and v == 0:
-            return color
-        new_h = int((h + self._effective_hue_degrees()) % 360)
-        out = QColor.fromHsv(new_h, min(255, s), min(255, v))
-        return QColor(out.red(), out.green(), out.blue(), a)
-
-    def _glow_offsets(self):
-        """Return list of (dx, dy, alpha_scale) for glow layers from config (radius 1–3 = more glow)."""
+    def glow_settings(self):
+        """(strength 0-100, radius 1-3) from config."""
         glow_cfg = self.config.get("glow") or {}
-        radius = max(1, min(3, _safe_int(glow_cfg.get("radius"), 3)))
-        # Rings at 1px, 2px, 3px with decreasing alpha for softer, larger glow
-        scale_by_d = {1: 1.0, 2: 0.55, 3: 0.3}
-        offsets = []
-        for d in (1, 2, 3):
-            if d > radius:
-                break
-            scale = scale_by_d.get(d, 0.3)
-            for dx, dy in ((-d,-d),(-d,0),(-d,d),(0,-d),(0,d),(d,-d),(d,0),(d,d)):
-                if (dx, dy) == (0, 0):
-                    continue
-                offsets.append((dx, dy, scale))
-        return offsets
+        return (max(0, min(100, _safe_int(glow_cfg.get("strength"), 90))),
+                max(1, min(3, _safe_int(glow_cfg.get("radius"), 3))))
 
-    def _draw_char_glow(self, painter, x, y, char, color, base_glow_alpha=70):
-        """Draw a character with configurable luminous glow (strength 0 = no glow)."""
-        glow_cfg = self.config.get("glow") or {}
-        strength = max(0, min(100, _safe_int(glow_cfg.get("strength"), 90)))
-        if strength <= 0:
-            painter.setPen(color)
-            painter.drawText(x, int(y), char)
-            return
-        r, g, b, a = color.red(), color.green(), color.blue(), color.alpha()
-        alpha_scale = strength / 100.0
-        offsets = self._glow_offsets()
-        for dx, dy, scale in offsets:
-            glow_alpha = max(0, min(255, int(base_glow_alpha * alpha_scale * scale)))
-            if glow_alpha <= 0:
-                continue
-            painter.setPen(QColor(max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)), min(glow_alpha, a)))
-            painter.drawText(x + dx, int(y) + dy, char)
-        painter.setPen(color)
-        painter.drawText(x, int(y), char)
-    
     def paintEvent(self, event):
         """Paint the matrix rain effect (Matrix-style: white leading shine, green trail fade, glow)"""
         try:
@@ -601,79 +718,104 @@ class MatrixRainWidget(QWidget):
             painter.setFont(self.font)
             painter.setRenderHint(QPainter.Antialiasing)
             painter.setRenderHint(QPainter.TextAntialiasing)
-            
-            height = self.height()
-            columns = getattr(self, "columns", [])
         except Exception:
             return
-        # Optional opaque black backdrop while the screensaver overlay is showing
+        self.paint_rain(painter)
+
+    def paint_rain(self, painter):
+        """Draw the rain with painter; shared by this overlay and the solid screensaver window."""
+        height = self.height()
+        columns = getattr(self, "columns", [])
         try:
-            screensaver_cfg = self.config.get("screensaver") or {}
-            if getattr(self, "_screensaver_active", False) and screensaver_cfg.get("black_background", False):
-                painter.fillRect(self.rect(), Qt.black)
-        except Exception:
-            pass
-        try:
+            # Settings and hue are resolved once per frame; the atlas only re-tints when the integer hue moves
+            strength, radius = self.glow_settings()
+            atlas = self.atlas
+            atlas.prepare(strength, radius, self._effective_hue_degrees())
+            images = atlas.images
+            head_core, head_glow, head2 = images["head_core"], images["head_glow"], images["head2"]
+            near, near_glow, trail = images["near"], images["near_glow"], images["trail"]
+            slots = atlas.slots
+            cw, chh = atlas.cell_w, atlas.cell_h
+            top = atlas.ascent + atlas.PAD  # baseline y -> sprite top
+            ci = atlas.CORE_INSET
+            ccw, cch = cw - 2 * ci, chh - 2 * ci
+            draw = painter.drawImage
+            set_opacity = painter.setOpacity
+            char_height = self.char_height
             bottom_fade_zone = max(60, height // 8)
+            fade_start = height - bottom_fade_zone
             mouse_highlight = self.config.get("mouse_highlight", False)
             cursor_pos = self.mapFromGlobal(QCursor.pos()) if mouse_highlight else None
+            cx, cy = (cursor_pos.x(), cursor_pos.y()) if cursor_pos is not None else (None, None)
+            opacity = None  # last value given to set_opacity, so runs of equal trail alpha skip the call
             for col in columns:
-                if not getattr(col, "chars", None) or col.length <= 0:
+                chars = col.chars
+                if not chars or col.length <= 0:
                     continue
                 L = max(col.length, 1)
                 try:
-                    ho = getattr(col, "head_offset", 0)
-                    head_index = int(ho) % L
+                    head_index = int(col.head_offset) % L
                 except (TypeError, ValueError):
                     head_index = 0
-                for i, char in enumerate(col.chars):
-                    y = col.y + (i * self.char_height)
-                    if -self.char_height <= y <= height:
-                        steps_behind = (head_index - i) % L
-                        bottom_fade = 1.0
-                        if y > height - bottom_fade_zone:
-                            bottom_fade = max(0.0, (height - y) / bottom_fade_zone)
-                        # Mouse highlight: character under cursor glows
-                        under_cursor = False
-                        if cursor_pos is not None:
-                            cx, cy = cursor_pos.x(), cursor_pos.y()
-                            if col.x <= cx < col.x + self.char_width and int(y) - self.char_height <= cy <= int(y):
-                                under_cursor = True
-                        if under_cursor:
-                            painter.setPen(self._apply_hue(QColor(255, 255, 255, 255)))
-                            painter.drawText(col.x, int(y), char)
-                            continue
-                        if steps_behind == 0:
-                            # White shine here (moves down the column over time)
-                            glow_cfg = self.config.get("glow") or {}
-                            strength = max(0, min(100, _safe_int(glow_cfg.get("strength"), 90)))
-                            if strength > 0:
-                                alpha_scale = strength / 100.0 * bottom_fade
-                                for dx, dy, scale in self._glow_offsets():
-                                    a_glow = max(0, min(255, int(130 * alpha_scale * scale)))
-                                    if a_glow > 0:
-                                        painter.setPen(self._apply_hue(QColor(180, 255, 180, a_glow)))
-                                        painter.drawText(col.x + dx, int(y) + dy, char)
-                            a = int(255 * bottom_fade)
-                            painter.setPen(self._apply_hue(QColor(255, 255, 255, a)))
-                            painter.drawText(col.x, int(y), char)
-                        elif steps_behind <= 2:
-                            color = self._apply_hue(QColor(0, 255, 70, int(255 * bottom_fade)))
-                            self._draw_char_glow(painter, col.x, y, char, color, base_glow_alpha=80)
-                        elif steps_behind <= 6:
-                            persistence = max(0.3, getattr(col, "trail_persistence", 1.0))
-                            eff = (steps_behind - 2) / persistence  # Slower fade for high-persistence columns
-                            alpha = int(220 * (1 - min(1, eff / 5)) * bottom_fade)
-                            color = self._apply_hue(QColor(0, 220, 60, max(alpha, 80)))
-                            self._draw_char_glow(painter, col.x, y, char, color, base_glow_alpha=40)
-                        else:
-                            persistence = max(0.3, getattr(col, "trail_persistence", 1.0))
-                            eff_trail = (steps_behind - 6) / persistence
-                            denom = max(L - 6, 1)
-                            alpha = int(160 * (1 - min(1, eff_trail / denom)) * bottom_fade)
-                            color = self._apply_hue(QColor(0, 180, 55, max(alpha, 60)))
-                            painter.setPen(color)
-                            painter.drawText(col.x, int(y), char)
+                persistence = max(0.3, col.trail_persistence)
+                denom = max(L - 6, 1)
+                trail_rate = 1.0 / (persistence * denom)
+                col_y = col.y
+                sx_col = col.x - atlas.PAD
+                cx_col = sx_col + ci
+                in_cursor_col = cx is not None and col.x <= cx < col.x + self.char_width
+                # Only walk the rows that are on screen (columns extend well above and below it)
+                first = max(0, math.ceil((-char_height - col_y) / char_height))
+                last = min(len(chars), math.floor((height - col_y) / char_height) + 1)
+                for i in range(first, last):
+                    y = col_y + i * char_height
+                    slot = slots.get(chars[i])
+                    if slot is None:  # not registered (message chars are added when injected)
+                        continue
+                    sx, sy = slot
+                    csx, csy = sx + ci, sy + ci
+                    iy = int(y)
+                    steps_behind = head_index - i
+                    if steps_behind < 0:
+                        steps_behind += L
+                    under_cursor = in_cursor_col and iy - char_height <= cy <= iy
+                    if steps_behind > 6 and not under_cursor:
+                        # Trail (the bulk of the glyphs): kept to the bare minimum of work per character
+                        fade = 1 - min(1, (steps_behind - 6) * trail_rate)
+                        if y > fade_start:
+                            fade *= max(0.0, (height - y) / bottom_fade_zone)
+                        alpha = int(160 * fade)
+                        trail_opacity = (alpha if alpha > 60 else 60) / 255.0
+                        if trail_opacity != opacity:
+                            set_opacity(trail_opacity)
+                            opacity = trail_opacity
+                        draw(cx_col, iy - top + ci, trail, csx, csy, ccw, cch)
+                        continue
+                    opacity = None  # the head/near tiers below set their own
+                    dy = iy - top
+                    cdy = dy + ci
+                    bottom_fade = max(0.0, (height - y) / bottom_fade_zone) if y > fade_start else 1.0
+                    # Mouse highlight: character under cursor drawn solid white
+                    if under_cursor:
+                        set_opacity(1.0)
+                        draw(cx_col, cdy, head_core, csx, csy, ccw, cch)
+                        continue
+                    if steps_behind == 0:
+                        # White shine here (moves down the column over time)
+                        set_opacity(bottom_fade)
+                        draw(sx_col, dy, head_glow, sx, sy, cw, chh)
+                        set_opacity(int(255 * bottom_fade) / 255.0)
+                        draw(cx_col, cdy, head_core, csx, csy, ccw, cch)
+                    elif steps_behind <= 2:
+                        set_opacity(int(255 * bottom_fade) / 255.0)
+                        draw(sx_col, dy, head2, sx, sy, cw, chh)
+                    else:
+                        eff = (steps_behind - 2) / persistence  # Slower fade for high-persistence columns
+                        alpha = int(220 * (1 - min(1, eff / 5)) * bottom_fade)
+                        set_opacity(1.0)
+                        draw(sx_col, dy, near_glow, sx, sy, cw, chh)
+                        set_opacity(max(alpha, 80) / 255.0)
+                        draw(cx_col, cdy, near, csx, csy, ccw, cch)
         except Exception:
             pass
     
@@ -688,14 +830,20 @@ class MatrixRainWidget(QWidget):
                         self._screensaver_dismiss_timer.stop()
                 except Exception:
                     pass
+            # Animation steps since the last frame, from the clock, so motion does not depend on the frame rate
+            # (capped so a stall does not make the rain jump)
+            now = time.perf_counter()
+            last = getattr(self, "_last_tick", None)
+            self._last_tick = now
+            steps = 1.0 if last is None else min(5.0, (now - last) * ANIMATION_STEPS_PER_SEC)
             height = self.height()
             columns = getattr(self, "columns", [])
             for col in columns:
-                col.update(height)
+                col.update(height, steps)
             # Hue cycle angle is derived from the wall clock in _effective_hue_degrees (no per-frame state)
             messages = self.config.get("custom_messages") or []
             if messages:
-                self._message_inject_counter = getattr(self, "_message_inject_counter", 0) + 1
+                self._message_inject_counter = getattr(self, "_message_inject_counter", 0) + steps
                 interval = getattr(self, "_message_inject_interval", 30)
                 if self._message_inject_counter >= interval:
                     self._message_inject_counter = 0
@@ -704,8 +852,12 @@ class MatrixRainWidget(QWidget):
                         col = random.choice(eligibles)
                         msg = random.choice(messages)
                         if str(msg).strip():
+                            self.atlas.add_chars(msg.strip())
                             col.set_message(msg.strip())
-            self.update()
+            if self._solid_saver.isVisible():
+                self._solid_saver.update()
+            else:
+                self.update()
         except Exception:
             pass
     
@@ -737,9 +889,41 @@ class MatrixRainWidget(QWidget):
             _install_screensaver_keyboard_hook(self)
             _install_screensaver_mouse_hook(self)
             self._sync_geometry_to_screen()
-            self.showFullScreen()
-            self.raise_()
-            self.activateWindow()
+            # Black background needs no see-through desktop, so use the cheaper opaque window
+            if (cfg.get("black_background") and self._try_gpu_saver
+                    and not isinstance(self._solid_saver, GLScreensaverWindow)):
+                self._try_gpu_saver = False  # decide once per run
+                if gl_screensaver_supported():
+                    self._solid_saver.retired = True
+                    self._solid_saver = GLScreensaverWindow(self)
+            view = self._solid_saver if cfg.get("black_background") else self
+            if view is self._solid_saver:
+                view.setGeometry(self.geometry())
+                self._start_animation(precise=isinstance(view, GLScreensaverWindow))
+            view.showFullScreen()
+            view.raise_()
+            view.activateWindow()
+
+    def _use_cpu_screensaver(self):
+        """GPU window failed to initialise: swap in the CPU window, keeping the screensaver up if it is."""
+        old = self._solid_saver
+        self._solid_saver = SolidScreensaverWindow(self)
+        if old.isVisible():
+            self._solid_saver.setGeometry(self.geometry())
+            self._start_animation()  # back to the default timer: CPU frames are too costly for full fps
+            self._solid_saver.showFullScreen()
+            self._solid_saver.raise_()
+            self._solid_saver.activateWindow()
+        old.retired = True
+        old.hide()
+
+    def _start_animation(self, precise=False):
+        """(Re)start the frame timer. The default timer only ticks ~21 times a second on Windows at the
+        configured 33 ms; the precise one reaches the configured fps but is only worth it when frames
+        are cheap (GPU screensaver). Motion is time-based, so both look the same apart from smoothness."""
+        self._last_tick = None
+        self.timer.setTimerType(Qt.PreciseTimer if precise else Qt.CoarseTimer)
+        self.timer.start(self._animation_interval)
 
     def _check_screensaver_dismiss(self):
         """When screensaver is on, detect activity via idle time and stop displaying."""
@@ -761,7 +945,10 @@ class MatrixRainWidget(QWidget):
             self._screensaver_dismiss_timer.stop()
             _uninstall_screensaver_keyboard_hook()
             _uninstall_screensaver_mouse_hook()
+            self._solid_saver.hide()
             self.hide()
+            self.timer.stop()  # hideEvent does not fire if only the solid window was showing
+            self.atlas.trim()
 
     def mousePressEvent(self, event):
         if getattr(self, "_screensaver_active", False):
@@ -822,6 +1009,10 @@ class MatrixRainWidget(QWidget):
             self._sync_geometry_to_screen()
             if self.isFullScreen():
                 self.showFullScreen()
+        elif self._solid_saver.isVisible():
+            self._sync_geometry_to_screen()
+            self._solid_saver.setGeometry(self.geometry())
+            self._solid_saver.showFullScreen()
 
     def _sync_geometry_to_screen(self):
         """Match the primary screen; the screen can change size while we are hidden in the tray."""
@@ -838,7 +1029,7 @@ class MatrixRainWidget(QWidget):
         """Start animation when window is shown."""
         super().showEvent(event)
         if not self.timer.isActive():
-            self.timer.start(self._animation_interval)
+            self._start_animation()
 
     def hideEvent(self, event):
         """Stop animation when hidden to save CPU and keep idle-check timer responsive.
@@ -846,6 +1037,7 @@ class MatrixRainWidget(QWidget):
         screensaver is active, clear its state so it is not left 'active' but frozen."""
         super().hideEvent(event)
         self.timer.stop()
+        self.atlas.trim()  # derived sprite images are rebuilt on the next frame drawn
         if getattr(self, "_screensaver_active", False):
             self._dismiss_screensaver()
 
@@ -1031,6 +1223,349 @@ class MatrixRainWidget(QWidget):
     def quit_app(self):
         self.tray_icon.hide()
         QApplication.quit()
+
+
+class SolidScreensaverWindow(QWidget):
+    """Opaque fullscreen window for the black-background screensaver.
+
+    The overlay is a per-pixel-alpha window so the desktop shows through, which Windows has to
+    composite in full every frame; behind a black background that work buys nothing. Rain state,
+    timers and input handling stay on the MatrixRainWidget this window draws for.
+    """
+    def __init__(self, rain):
+        super().__init__()
+        self.rain = rain
+        self.retired = False  # set when replaced, so hiding it does not end the screensaver
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)  # paintEvent covers every pixel
+        self.setMouseTracking(True)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.black)
+        self.rain.paint_rain(painter)
+
+    def mousePressEvent(self, event):
+        self.rain.mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self.rain.mouseMoveEvent(event)
+
+    def keyPressEvent(self, event):
+        self.rain.keyPressEvent(event)
+
+    def hideEvent(self, event):
+        """Hidden externally (e.g. Windows minimised it when another app took focus): end the screensaver."""
+        super().hideEvent(event)
+        if not self.retired:
+            self.rain._dismiss_screensaver()
+
+
+GL_RAIN_VERTEX_SHADER = """#version 410 core
+void main() {
+    // One triangle that covers the whole screen
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+# Same tiers, fades and draw order as MatrixRainWidget.paint_rain, evaluated per pixel: every glyph
+# sprite covering the pixel is composited (premultiplied "over"), columns left to right, rows top to
+# bottom, glow before core. The masks are GlyphAtlas images; colours come in already hue-shifted.
+GL_RAIN_FRAGMENT_SHADER = """#version 410 core
+uniform sampler2D uCore, uGlowHead, uHead2, uGlowNear;  // white glyph masks (alpha), atlas layout
+uniform sampler2D uCols;   // per column: y, head index, length, trail persistence
+uniform sampler2D uChars;  // [row, column]: atlas cell (x, y) of the glyph; x < 0 = none
+uniform int uNumCols, uColSpacing, uCharHeight, uCharWidth, uCellW, uCellH, uPad, uTop, uHighlight;
+uniform float uHeight, uFadeZone, uDpr, uFbHeight;
+uniform vec2 uCursor;
+uniform vec3 uHeadGlowRgb, uHead2Rgb, uNearRgb, uTrailRgb;
+out vec4 fragColor;
+
+vec4 acc;
+void over(vec3 rgb, float a) { acc = vec4(rgb * a, a) + acc * (1.0 - a); }
+
+void main() {
+    ivec2 p = ivec2(floor(vec2(gl_FragCoord.x, uFbHeight - gl_FragCoord.y) / uDpr));
+    acc = vec4(0.0);
+    float ch = float(uCharHeight);
+    float fadeStart = uHeight - uFadeZone;
+    // Columns whose sprites (x - pad .. x - pad + cell width) cover this pixel
+    int c0 = max(0, int(ceil(float(p.x + uPad - uCellW + 1) / float(uColSpacing))));
+    int c1 = min(uNumCols - 1, int(floor(float(p.x + uPad) / float(uColSpacing))));
+    for (int c = c0; c <= c1; ++c) {
+        vec4 col = texelFetch(uCols, ivec2(c, 0), 0);
+        int len = int(col.z);
+        int head = int(col.y);
+        float persistence = col.w;
+        int colX = c * uColSpacing;
+        int lx = p.x - (colX - uPad);
+        // Rows whose sprites (baseline - top .. + cell height) may cover this pixel
+        int r0 = max(0, int(floor((float(p.y + uTop - uCellH) - col.x) / ch)));
+        int r1 = min(len - 1, int(floor((float(p.y + uTop) - col.x) / ch)) + 1);
+        for (int r = r0; r <= r1; ++r) {
+            float y = col.x + float(r) * ch;
+            if (y < -ch || y > uHeight) continue;
+            int iy = int(y);
+            int ly = p.y - (iy - uTop);
+            if (ly < 0 || ly >= uCellH) continue;
+            vec2 cell = texelFetch(uChars, ivec2(r, c), 0).xy;
+            if (cell.x < 0.0) continue;
+            ivec2 t = ivec2(cell) + ivec2(lx, ly);
+            float core = texelFetch(uCore, t, 0).a;
+            float fade = y > fadeStart ? max(0.0, (uHeight - y) / uFadeZone) : 1.0;
+            if (uHighlight != 0 && float(colX) <= uCursor.x && uCursor.x < float(colX + uCharWidth)
+                    && float(iy - uCharHeight) <= uCursor.y && uCursor.y <= float(iy)) {
+                over(vec3(1.0), core);  // mouse highlight: solid white, no glow
+                continue;
+            }
+            int s = head - r;
+            if (s < 0) s += len;
+            if (s == 0) {
+                over(uHeadGlowRgb, texelFetch(uGlowHead, t, 0).a * fade);
+                over(vec3(1.0), core * floor(255.0 * fade) / 255.0);
+            } else if (s <= 2) {
+                over(uHead2Rgb, texelFetch(uHead2, t, 0).a * floor(255.0 * fade) / 255.0);
+            } else if (s <= 6) {
+                float a = floor(220.0 * (1.0 - min(1.0, float(s - 2) / persistence / 5.0)) * fade);
+                over(uNearRgb, texelFetch(uGlowNear, t, 0).a);
+                over(uNearRgb, core * max(a, 80.0) / 255.0);
+            } else {
+                float a = floor(160.0 * (1.0 - min(1.0, float(s - 6) / (persistence * float(max(len - 6, 1))))) * fade);
+                over(uTrailRgb, core * max(a, 60.0) / 255.0);
+            }
+        }
+    }
+    fragColor = vec4(acc.rgb, 1.0);  // over the black background
+}
+"""
+
+_GL_TEXTURE_2D, _GL_TRIANGLES, _GL_COLOR_BUFFER_BIT = 0x0DE1, 0x0004, 0x4000
+
+
+def gl_surface_format():
+    """OpenGL 4.1 core: what GLRainRenderer's shaders and PyQt5's function bindings need."""
+    fmt = QSurfaceFormat()
+    fmt.setVersion(4, 1)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
+    return fmt
+
+
+class GLRainRenderer:
+    """Draws the rain on the GPU. Per frame the CPU only uploads each column's position and any
+    changed characters (a few KB); the fragment shader does the per-glyph tiers, fades and blending
+    that cost tens of thousands of QPainter calls per frame on a large screen."""
+
+    def __init__(self):
+        self.ready = False
+
+    def initialize(self, context):
+        """Set up GL objects in the current context; raises RuntimeError if anything is unsupported."""
+        gl = context.versionFunctions(QOpenGLVersionProfile(context.format()))
+        if gl is None or not gl.initializeOpenGLFunctions():
+            raise RuntimeError("OpenGL 4.1 functions unavailable")
+        self.gl = gl
+        self.program = QOpenGLShaderProgram()
+        if not (self.program.addShaderFromSourceCode(QOpenGLShader.Vertex, GL_RAIN_VERTEX_SHADER)
+                and self.program.addShaderFromSourceCode(QOpenGLShader.Fragment, GL_RAIN_FRAGMENT_SHADER)
+                and self.program.link()):
+            raise RuntimeError("shader build failed: " + self.program.log())
+        self.vao = QOpenGLVertexArrayObject()  # core profile cannot draw without one bound
+        if not self.vao.create():
+            raise RuntimeError("vertex array object unavailable")
+        self._loc = {}
+        self._masks = None
+        self._mask_textures = []
+        self._cols_tex = self._chars_tex = None
+        self._shape = None
+        self.ready = True
+
+    def _uniform(self, name):
+        loc = self._loc.get(name)
+        if loc is None:
+            loc = self._loc[name] = self.program.uniformLocation(name)
+        return loc
+
+    @staticmethod
+    def _float_texture(fmt, width, height):
+        tex = QOpenGLTexture(QOpenGLTexture.Target2D)
+        tex.setFormat(fmt)
+        tex.setSize(width, height)
+        tex.setMipLevels(1)
+        tex.allocateStorage()
+        tex.setMinMagFilters(QOpenGLTexture.Nearest, QOpenGLTexture.Nearest)
+        return tex
+
+    def _sync_masks(self, masks):
+        """Upload the atlas masks when they were rebuilt (glow settings, new message glyphs, trim)."""
+        if masks is self._masks:
+            return False
+        for tex in self._mask_textures:
+            tex.destroy()
+        self._mask_textures = []
+        for name in ("core", "glow130", "t2", "glow40"):
+            tex = QOpenGLTexture(masks[name], QOpenGLTexture.DontGenerateMipMaps)
+            tex.setMinMagFilters(QOpenGLTexture.Nearest, QOpenGLTexture.Nearest)
+            self._mask_textures.append(tex)
+        self._masks = masks
+        return True
+
+    def _sync_columns(self, columns, slots, remap):
+        """Upload column positions every frame; re-encode characters only where they changed."""
+        n = max(1, len(columns))
+        width = max([len(c.chars) for c in columns] + [1])
+        if self._shape is None or self._shape[0] != n or self._shape[1] < width:
+            for tex in (self._cols_tex, self._chars_tex):
+                if tex is not None:
+                    tex.destroy()
+            width = (width + 63) // 64 * 64  # headroom so longer messages rarely force a resize
+            self._shape = (n, width)
+            self._cols_tex = self._float_texture(QOpenGLTexture.RGBA32F, n, 1)
+            self._chars_tex = self._float_texture(QOpenGLTexture.RG32F, width, n)
+            self._chars = array("f", [-1.0]) * (2 * width * n)
+            self._encoded = [None] * n
+            remap = True
+        width = self._shape[1]
+        params = array("f")
+        chars_dirty = False
+        for c, col in enumerate(columns):
+            L = max(col.length, 1)
+            try:
+                head = int(col.head_offset) % L
+            except (TypeError, ValueError):
+                head = 0
+            params.extend((col.y, head, col.length if col.chars else 0, max(0.3, col.trail_persistence)))
+            done = self._encoded[c]
+            version = col.chars_version
+            if not remap and done is not None and done[0] is col and done[1] == version:
+                continue
+            base = 2 * width * c
+            flicker = col.last_flicker
+            if (not remap and done is not None and done[0] is col and done[1] == version - 1
+                    and flicker is not None and flicker[0] == version):
+                rows = (flicker[1],)  # only one character changed since the last upload
+            else:
+                self._chars[base:base + 2 * width] = array("f", [-1.0]) * (2 * width)
+                rows = range(min(len(col.chars), width))
+            for r in rows:
+                slot = slots.get(col.chars[r])
+                self._chars[base + 2 * r:base + 2 * r + 2] = array("f", slot[:2] if slot else (-1.0, -1.0))
+            self._encoded[c] = (col, version)
+            chars_dirty = True
+        self._cols_tex.setData(QOpenGLTexture.RGBA, QOpenGLTexture.Float32, sip.voidptr(params.buffer_info()[0]))
+        if chars_dirty:
+            self._chars_tex.setData(QOpenGLTexture.RG, QOpenGLTexture.Float32,
+                                    sip.voidptr(self._chars.buffer_info()[0]))
+
+    def render(self, rain, fb_width, fb_height, dpr=1.0):
+        """Draw one frame of rain's columns into the bound framebuffer (black background)."""
+        gl = self.gl
+        atlas = rain.atlas
+        strength, radius = rain.glow_settings()
+        remap = self._sync_masks(atlas.masks(strength, radius))  # new atlas layout moves every glyph
+        columns = getattr(rain, "columns", [])
+        self._sync_columns(columns, atlas.slots, remap)
+
+        height = rain.height()
+        hue = int(rain._effective_hue_degrees()) % 360
+        cursor = rain.mapFromGlobal(QCursor.pos()) if rain.config.get("mouse_highlight", False) else None
+        gl.glViewport(0, 0, fb_width, fb_height)
+        gl.glClearColor(0.0, 0.0, 0.0, 1.0)
+        gl.glClear(_GL_COLOR_BUFFER_BIT)
+        self.program.bind()
+        self.vao.bind()
+        u = self._uniform
+        for unit, (name, tex) in enumerate(zip(("uCore", "uGlowHead", "uHead2", "uGlowNear"), self._mask_textures)):
+            tex.bind(unit)
+            gl.glUniform1i(u(name), unit)
+        self._cols_tex.bind(4)
+        gl.glUniform1i(u("uCols"), 4)
+        self._chars_tex.bind(5)
+        gl.glUniform1i(u("uChars"), 5)
+        for name, value in (("uNumCols", len(columns)), ("uColSpacing", rain.col_spacing),
+                            ("uCharHeight", rain.char_height), ("uCharWidth", rain.char_width),
+                            ("uCellW", atlas.cell_w), ("uCellH", atlas.cell_h), ("uPad", atlas.PAD),
+                            ("uTop", atlas.ascent + atlas.PAD), ("uHighlight", int(cursor is not None))):
+            gl.glUniform1i(u(name), value)
+        for name, value in (("uHeight", float(height)), ("uFadeZone", float(max(60, height // 8))),
+                            ("uDpr", float(dpr)), ("uFbHeight", float(fb_height))):
+            gl.glUniform1f(u(name), value)
+        gl.glUniform2f(u("uCursor"), *((float(cursor.x()), float(cursor.y())) if cursor is not None else (-1e9, -1e9)))
+        for name, tier in (("uHeadGlowRgb", "head_glow"), ("uHead2Rgb", "head2"), ("uNearRgb", "near"),
+                           ("uTrailRgb", "trail")):
+            r, g, b = hue_shift_rgb(atlas.TIERS[tier][1], hue)
+            gl.glUniform3f(u(name), r / 255.0, g / 255.0, b / 255.0)
+        gl.glDrawArrays(_GL_TRIANGLES, 0, 3)
+        self.vao.release()
+        self.program.release()
+
+
+_gl_support = None
+
+
+def gl_screensaver_supported():
+    """True if this machine can run GLRainRenderer (checked once, off screen)."""
+    global _gl_support
+    if _gl_support is None:
+        _gl_support = False
+        try:
+            ctx = QOpenGLContext()
+            ctx.setFormat(gl_surface_format())
+            surface = QOffscreenSurface()
+            surface.setFormat(gl_surface_format())
+            surface.create()
+            if ctx.create() and not ctx.isOpenGLES() and (ctx.format().majorVersion(), ctx.format().minorVersion()) >= (4, 1) \
+                    and ctx.makeCurrent(surface):
+                GLRainRenderer().initialize(ctx)
+                ctx.doneCurrent()
+                _gl_support = True
+        except Exception as e:
+            print(f"GPU screensaver unavailable ({e}); using the CPU renderer.")
+    return _gl_support
+
+
+class GLScreensaverWindow(QOpenGLWindow):
+    """Fullscreen black-background screensaver drawn by GLRainRenderer (input handling stays on the
+    MatrixRainWidget, as with SolidScreensaverWindow). If GL setup fails at runtime it hands over
+    to the CPU window."""
+
+    def __init__(self, rain):
+        super().__init__()
+        self.rain = rain
+        self.retired = False
+        self.setFormat(gl_surface_format())
+        self.setFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+        self.renderer = GLRainRenderer()
+
+    def activateWindow(self):
+        self.requestActivate()
+
+    def initializeGL(self):
+        try:
+            self.renderer.initialize(self.context())
+        except Exception as e:
+            print(f"GPU screensaver failed ({e}); switching to the CPU renderer.")
+            QTimer.singleShot(0, self.rain._use_cpu_screensaver)
+
+    def paintGL(self):
+        if self.renderer.ready:
+            dpr = self.devicePixelRatio()
+            self.renderer.render(self.rain, round(self.width() * dpr), round(self.height() * dpr), dpr)
+
+    def mousePressEvent(self, event):
+        self.rain.mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self.rain.mouseMoveEvent(event)
+
+    def keyPressEvent(self, event):
+        self.rain.keyPressEvent(event)
+
+    def hideEvent(self, event):
+        """Hidden externally (e.g. Windows minimised it when another app took focus): end the screensaver."""
+        super().hideEvent(event)
+        if not self.retired:
+            self.rain._dismiss_screensaver()
 
 
 class ManageMessagesDialog(QDialog):
