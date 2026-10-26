@@ -57,6 +57,267 @@ class StartupCommandTests(unittest.TestCase):
         self.assertTrue(cmd.startswith(r'"C:\Py\pythonw.exe"'))
 
 
+class WrapWordsTests(unittest.TestCase):
+    def test_wraps_at_word_boundaries(self):
+        from matrix_rain import wrap_words
+        self.assertEqual(wrap_words("I am calm, focused, and in control", 14),
+                         ["I am calm,", "focused, and", "in control"])
+
+    def test_short_text_stays_on_one_line(self):
+        from matrix_rain import wrap_words
+        self.assertEqual(wrap_words("  I am   enough ", 40), ["I am enough"])
+
+    def test_long_word_gets_own_line(self):
+        from matrix_rain import wrap_words
+        self.assertEqual(wrap_words("go supercalifragilistic now", 8), ["go", "supercalifragilistic", "now"])
+
+
+class AffirmationConfigTests(unittest.TestCase):
+    def test_missing_block_gets_defaults(self):
+        from matrix_rain import normalize_affirmations, DEFAULT_AFFIRMATIONS
+        cfg = normalize_affirmations(None)
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["styles"], ["decode", "catch", "type"])
+        self.assertTrue(cfg["rotate"])
+        self.assertEqual(cfg["interval_seconds"], 5)
+        self.assertEqual(cfg["hold_seconds"], 7)
+        self.assertEqual(cfg["backing"], "dim")
+        self.assertEqual(cfg["messages"], DEFAULT_AFFIRMATIONS)
+        self.assertIsNot(cfg["messages"], DEFAULT_AFFIRMATIONS)  # editing one config must not edit the defaults
+
+    def test_bad_values_are_fixed(self):
+        from matrix_rain import normalize_affirmations
+        cfg = normalize_affirmations({"styles": ["sparkle"], "interval_seconds": "x", "hold_seconds": 999,
+                                      "backing": "fog", "messages": ["  I am here ", "", 3]})
+        self.assertEqual(cfg["styles"], ["decode"])
+        self.assertEqual(cfg["interval_seconds"], 5)
+        self.assertEqual(cfg["hold_seconds"], 60)
+        self.assertEqual(cfg["backing"], "dim")
+        self.assertEqual(cfg["messages"], ["I am here", "3"])
+
+    def test_load_config_adds_block_to_old_file(self):
+        import json, os, tempfile
+        import matrix_rain
+        path = os.path.join(tempfile.mkdtemp(), "matrix_config.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"custom_messages": ["hi"]}, f)
+        orig = matrix_rain.CONFIG_PATH
+        matrix_rain.CONFIG_PATH = path
+        try:
+            cfg = matrix_rain.load_config()
+        finally:
+            matrix_rain.CONFIG_PATH = orig
+        self.assertTrue(cfg["affirmations"]["enabled"])
+        self.assertEqual(cfg["custom_messages"], ["hi"])
+
+
+class AffirmationPlayerTests(unittest.TestCase):
+    W, H, CW, CH = 1920, 1080, 20, 24
+
+    def _cfg(self, **kw):
+        from matrix_rain import normalize_affirmations
+        return normalize_affirmations(dict({"messages": ["I am enough", "I am allowed to rest"],
+                                            "clock_sync": False}, **kw))
+
+    def _player(self):
+        import random
+        from matrix_rain import AffirmationPlayer
+        return AffirmationPlayer(random.Random(7))
+
+    def _step(self, player, cfg, seconds, dt=0.05):
+        started = []
+        for _ in range(int(round(seconds / dt))):
+            a = player.update(dt, cfg, self.W, self.H, self.CW, self.CH)
+            if a is not None:
+                started.append(a)
+        return started
+
+    def test_first_one_starts_after_delay(self):
+        p, cfg = self._player(), self._cfg()
+        self.assertEqual(self._step(p, cfg, 1.9), [])
+        self.assertEqual(len(self._step(p, cfg, 0.2)), 1)
+
+    def test_styles_rotate_and_messages_do_not_repeat(self):
+        p, cfg = self._player(), self._cfg()
+        shown = self._step(p, cfg, 120)
+        self.assertGreater(len(shown), 6)
+        self.assertEqual([a.style for a in shown[:4]], ["decode", "catch", "type", "decode"])
+        for prev, cur in zip(shown, shown[1:]):
+            self.assertNotEqual(prev.text, cur.text)
+
+    def test_gap_after_one_leaves(self):
+        p, cfg = self._player(), self._cfg(interval_seconds=6)
+        a = self._step(p, cfg, 2.1)[0]
+        remaining = a.end - a.t
+        self.assertEqual(self._step(p, cfg, remaining + 5.8), [])
+        self.assertEqual(len(self._step(p, cfg, 0.4)), 1)
+
+    def test_fixed_style_without_rotate(self):
+        p, cfg = self._player(), self._cfg(rotate=False, styles=["type", "decode"])
+        self.assertEqual({a.style for a in self._step(p, cfg, 60)}, {"type"})
+
+    def test_disabled_shows_nothing(self):
+        p = self._player()
+        self.assertEqual(self._step(p, self._cfg(enabled=False), 30), [])
+        self.assertIsNone(p.current)
+
+    def test_text_is_centred_and_wrapped_on_screen(self):
+        import random
+        from matrix_rain import Affirmation
+        a = Affirmation("I am becoming the best version of myself " * 3, "decode", 5,
+                        800, 600, 20, 24, random.Random(1))
+        self.assertGreater(len(a.lines), 1)
+        xs = [c[1] for c in a.cells]
+        self.assertGreaterEqual(min(xs), 0)
+        self.assertLessEqual(max(xs) + 20, 800)
+        x0, y0, x1, y1 = a.band
+        self.assertAlmostEqual((x0 + x1) / 2, 400, delta=20)
+        self.assertAlmostEqual((y0 + y1) / 2, 300, delta=24)
+
+    def test_decode_letters_resolve_by_end_of_entrance(self):
+        import random
+        from matrix_rain import Affirmation
+        rng = random.Random(3)
+        a = Affirmation("I am enough", "decode", 5, 1920, 1080, 20, 24, rng)
+        a.t = 0.1
+        self.assertTrue(all(op[0] == "scramble" for op in a.ops(rng)))
+        a.t = a.in_dur
+        letters = [op[1] for op in a.ops(rng) if op[0] == "letter"]
+        self.assertEqual("".join(letters), "Iamenough")
+
+    def test_terminal_backspaces_then_ends(self):
+        import random
+        from matrix_rain import Affirmation
+        rng = random.Random(3)
+        a = Affirmation("I am enough", "type", 5, 1920, 1080, 20, 24, rng)
+        a.t = a.in_dur + a.hold + 0.3
+        partial = [op for op in a.ops(rng) if op[0] == "letter"]
+        self.assertTrue(0 < len(partial) < 9)
+        a.t = a.in_dur + a.hold + a.TYPE_OUT + 0.01
+        self.assertEqual([op for op in a.ops(rng) if op[0] == "letter"], [])
+        self.assertAlmostEqual(a.presence(), 1 - (a.TYPE_OUT + 0.01) / a.out_dur)
+
+    def test_presence_fades_in_holds_and_out(self):
+        import random
+        from matrix_rain import Affirmation
+        a = Affirmation("I am enough", "catch", 5, 1920, 1080, 20, 24, random.Random(2))
+        a.t = 0.3
+        self.assertAlmostEqual(a.presence(), 0.5)
+        a.t = a.in_dur + 1
+        self.assertEqual((a.phase(), a.presence()), ("hold", 1.0))
+        a.t = a.end
+        self.assertEqual(a.phase(), "out")
+        self.assertAlmostEqual(a.presence(), 0.0)
+
+
+class ClockSyncTests(unittest.TestCase):
+    MSGS = ["I am enough", "I am allowed to rest", "I am brave enough to begin", "Your work matters",
+            "I am free to be myself"]
+
+    def _cfg(self, **kw):
+        from matrix_rain import normalize_affirmations
+        return normalize_affirmations(dict({"messages": self.MSGS, "clock_sync": True}, **kw))
+
+    def test_each_round_shows_every_message_once(self):
+        from matrix_rain import clock_affirmation
+        n = len(self.MSGS)
+        for deck in (0, 1, 7, 123456):
+            got = [clock_affirmation(deck * n + i, self.MSGS, ["decode"], True)[0] for i in range(n)]
+            self.assertEqual(sorted(got), sorted(self.MSGS))
+
+    def test_never_the_same_message_twice_in_a_row(self):
+        from matrix_rain import clock_affirmation
+        prev = None
+        for slot in range(110_000_000, 110_005_000):
+            msg = clock_affirmation(slot, self.MSGS, ["decode"], True)[0]
+            self.assertNotEqual(msg, prev)
+            prev = msg
+
+    def test_styles_follow_the_slot(self):
+        from matrix_rain import clock_affirmation
+        styles = ["decode", "catch", "type"]
+        self.assertEqual([clock_affirmation(s, self.MSGS, styles, True)[1] for s in range(300, 304)],
+                         ["decode", "catch", "type", "decode"])
+        self.assertEqual(clock_affirmation(301, self.MSGS, styles, False)[1], "decode")
+
+    def test_two_pcs_started_apart_show_the_same_thing(self):
+        # PC A has been running; PC B starts its rain mid-entrance. Same clock -> same message, style and moment.
+        import random
+        from matrix_rain import AffirmationPlayer, affirmation_slot_seconds
+        cfg = self._cfg()
+        slot_len = affirmation_slot_seconds(cfg)
+        start = 1_800_000_000 // slot_len * slot_len + slot_len
+        a, b = AffirmationPlayer(random.Random(1)), AffirmationPlayer(random.Random(2))
+        a.update(0.03, cfg, 1920, 1080, 20, 24, now=start - 3)  # A was already running
+        self.assertIsNone(a.current)
+        got_a = a.update(0.03, cfg, 1920, 1080, 20, 24, now=start + 0.01)
+        got_b = b.update(0.03, cfg, 2560, 1440, 26, 30, now=start + 0.4)
+        self.assertEqual((got_a.text, got_a.style), (got_b.text, got_b.style))
+        self.assertAlmostEqual(got_b.t, 0.4, places=5)
+        a.update(0.03, cfg, 1920, 1080, 20, 24, now=start + 0.4)
+        self.assertAlmostEqual(a.current.t, 0.4, places=5)
+        # Same letter timings too: they are seeded by the slot, not by each PC's own random state
+        self.assertEqual([c[4] for c in got_a.cells], [c[4] for c in got_b.cells])
+
+    def test_joining_after_the_entrance_waits_for_the_next_slot(self):
+        from matrix_rain import AffirmationPlayer, affirmation_slot_seconds
+        cfg = self._cfg()
+        slot_len = affirmation_slot_seconds(cfg)
+        start = 1_800_000_000 // slot_len * slot_len
+        p = AffirmationPlayer()
+        self.assertIsNone(p.update(0.03, cfg, 1920, 1080, 20, 24, now=start + 5))
+        self.assertIsNone(p.update(0.03, cfg, 1920, 1080, 20, 24, now=start + 5.1))
+        self.assertIsNotNone(p.update(0.03, cfg, 1920, 1080, 20, 24, now=start + slot_len + 0.05))
+
+    def test_each_affirmation_ends_before_its_slot_does(self):
+        import random
+        from matrix_rain import Affirmation, affirmation_slot_seconds, AFFIRMATION_IN_MAX
+        cfg = self._cfg()
+        long_text = "meu nome e soh coisas boas acontecem comigo todos os dias de manha a noite " * 2
+        for style in ("decode", "catch", "type", "bloom"):
+            a = Affirmation(long_text, style, cfg["hold_seconds"], 1920, 1080, 20, 24, random.Random(9))
+            self.assertLessEqual(a.in_dur, AFFIRMATION_IN_MAX)
+            self.assertLessEqual(a.end + cfg["interval_seconds"], affirmation_slot_seconds(cfg) + 1e-9)
+
+
+class AffirmationFeedTests(unittest.TestCase):
+    def test_parse_skips_blanks_and_comments(self):
+        from matrix_rain import parse_affirmation_list
+        self.assertEqual(parse_affirmation_list("# list\r\n\r\n I am enough \r\n#x\r\nYour work matters"),
+                         ["I am enough", "Your work matters"])
+
+    def test_fetch_updates_list_and_cache(self):
+        import os, tempfile, time, pathlib
+        from matrix_rain import AffirmationFeed
+        d = tempfile.mkdtemp()
+        src = os.path.join(d, "affirmations.txt")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write("# header\nI am enough\nI am allowed to rest\n")
+        cache = os.path.join(d, "cache.txt")
+        feed = AffirmationFeed(cache)
+        self.assertEqual(feed.messages, [])
+        feed.poll(pathlib.Path(src).as_uri())
+        deadline = time.time() + 5
+        while feed._busy and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(feed.messages, ["I am enough", "I am allowed to rest"])
+        self.assertEqual(AffirmationFeed(cache).messages, feed.messages)  # next start uses the cached copy
+
+    def test_failed_fetch_keeps_cached_list(self):
+        import os, tempfile, time
+        from matrix_rain import AffirmationFeed
+        d = tempfile.mkdtemp()
+        cache = os.path.join(d, "cache.txt")
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write("I am enough\n")
+        feed = AffirmationFeed(cache)
+        feed.poll("file:///" + d.replace("\\", "/") + "/missing.txt")
+        deadline = time.time() + 5
+        while feed._busy and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(feed.messages, ["I am enough"])
+
+
 class ColumnStartTests(unittest.TestCase):
     def test_initial_columns_are_spread_across_screen(self):
         # Steady-state placement: most columns already have glyphs on screen at frame 0,
@@ -168,6 +429,35 @@ class ScreensaverStateTests(unittest.TestCase):
         w._solid_saver.hide()  # e.g. Windows minimised it
         self.assertFalse(w._screensaver_active)
         self.assertFalse(w.timer.isActive())
+
+    def test_affirmation_runs_and_paints_on_every_style(self):
+        # Drive the real widget: the timer step starts an affirmation and each style paints without error.
+        from PyQt5.QtGui import QImage, QPainter
+        w = self._widget()
+        w.resize(1280, 720)
+        w.config["affirmations"].update({"enabled": True, "messages": ["I am enough"], "backing": "dim",
+                                         "styles": ["decode", "catch", "type", "bloom"], "rotate": True,
+                                         "clock_sync": False, "source_url": ""})
+        w._start_animation()
+        w.affirm.wait = 0
+        seen = set()
+        img = QImage(1280, 720, QImage.Format_ARGB32_Premultiplied)
+        for _ in range(4000):
+            w._last_tick = __import__("time").perf_counter() - 0.05  # one 50 ms step per call
+            w.update_animation()
+            a = w.affirm.current
+            if a is not None:
+                seen.add(a.style)
+                p = QPainter(img)
+                w.paint_affirmation(p)
+                p.end()
+                if a.phase() == "hold":
+                    self.assertTrue(a.ops(w.affirm.rng))
+            if len(seen) == 4:
+                break
+        w.timer.stop()
+        self.assertEqual(seen, {"decode", "catch", "type", "bloom"})
+        self.assertIn("I", w._affirm_atlas[1].slots)
 
     def test_fallback_to_cpu_window_keeps_screensaver_up(self):
         # If the GPU window fails to initialise, its replacement takes over without ending the screensaver.

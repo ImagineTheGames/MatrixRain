@@ -35,5 +35,50 @@
     "hue": {
         "shift": 0,
         "cycle": true
+    },
+    "affirmations": {
+        "enabled": true,
+        "messages": [
+            "I am enough",
+            "I am worthy of love and respect",
+            "I am calm, focused, and in control",
+            "I am becoming the best version of myself",
+            "I am grateful for everything I have",
+            "I am strong, capable, and resilient",
+            "I am exactly where I need to be",
+            "I am open to new opportunities",
+            "I am safe. I am loved. I am whole.",
+            "I am in charge of how I feel",
+            "I am proud of how far I have come",
+            "I am creating a life I love",
+            "I am a magnet for good things",
+            "I am confident in my abilities",
+            "I am at peace with my past",
+            "I am allowed to rest",
+            "I am learning and growing every day",
+            "I am deserving of success",
+            "I am healthy, energized, and alive",
+            "I am the author of my story",
+            "I am loved more than I know",
+            "I am brave enough to begin",
+            "I am choosing joy today",
+            "I am free to be myself",
+            "You are doing better than you think",
+            "Your work matters",
+            "Today is full of possibility"
+        ],
+        "styles": [
+            "decode",
+            "catch",
+            "type"
+        ],
+        "rotate": true,
+        "interval_seconds": 5,
+        "hold_seconds": 7,
+        "backing": "dim",
+        "font_scale": 1.25,
+        "comment": "Centred affirmations over the rain. The list comes from source_url (one per line; 'messages' is the offline fallback). clock_sync: every PC shows the same line at the same time - keep hold/interval/styles the same on all of them. styles: decode, catch, type, bloom. backing: none, dim, clear.",
+        "source_url": "https://raw.githubusercontent.com/ImagineTheGames/MatrixRain/master/affirmations.txt",
+        "clock_sync": true
     }
 }

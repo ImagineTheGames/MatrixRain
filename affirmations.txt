@@ -1,0 +1,31 @@
+# Matrix Rain affirmations: one per line. Shown in the middle of the screen over the rain.
+# Every PC with "source_url" pointing here fetches this list (hourly) and, with clock_sync on,
+# shows the same line at the same moment. Blank lines and lines starting with # are ignored.
+
+I am enough
+I am worthy of love and respect
+I am calm, focused, and in control
+I am becoming the best version of myself
+I am grateful for everything I have
+I am strong, capable, and resilient
+I am exactly where I need to be
+I am open to new opportunities
+I am safe. I am loved. I am whole.
+I am in charge of how I feel
+I am proud of how far I have come
+I am creating a life I love
+I am a magnet for good things
+I am confident in my abilities
+I am at peace with my past
+I am allowed to rest
+I am learning and growing every day
+I am deserving of success
+I am healthy, energized, and alive
+I am the author of my story
+I am loved more than I know
+I am brave enough to begin
+I am choosing joy today
+I am free to be myself
+You are doing better than you think
+Your work matters
+Today is full of possibility

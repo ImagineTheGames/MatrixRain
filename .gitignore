@@ -20,3 +20,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Affirmations list fetched from GitHub (per machine)
+affirmations_cache.txt

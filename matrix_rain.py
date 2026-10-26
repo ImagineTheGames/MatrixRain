@@ -12,6 +12,8 @@ import json
 import os
 import time
 import math
+import threading
+import urllib.request
 import ctypes
 from array import array
 from ctypes import wintypes
@@ -21,9 +23,10 @@ from PyQt5.QtWidgets import (
     QPushButton, QHBoxLayout, QMessageBox, QDialogButtonBox,
     QDoubleSpinBox, QLabel, QFormLayout, QSlider, QCheckBox,
 )
-from PyQt5.QtCore import Qt, QTimer, QPoint
+from PyQt5.QtCore import Qt, QTimer, QPoint, QRectF
 from PyQt5.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QIcon, QPixmap, QCursor, QImage,
+    QBrush, QRadialGradient, QLinearGradient,
     QOpenGLWindow, QOpenGLContext, QOffscreenSurface, QSurfaceFormat, QOpenGLVersionProfile,
     QOpenGLShaderProgram, QOpenGLShader, QOpenGLVertexArrayObject, QOpenGLTexture,
 )
@@ -46,6 +49,95 @@ SPEED_SCALE = 0.85
 # many steps per second, so the rain moves the same at any frame rate. 64/3 is the rate a 33 ms
 # QTimer actually ticked at on Windows (15.6 ms timer granularity), i.e. the look the settings were tuned with.
 ANIMATION_STEPS_PER_SEC = 64 / 3
+
+# Affirmations: short lines shown one at a time in the middle of the screen, over the rain.
+# Entrance styles: decode (glyphs resolve into letters), catch (rain drops deposit letters),
+# type (typed with a block cursor), bloom (soft fade with glow).
+AFFIRMATION_STYLES = ("decode", "catch", "type", "bloom")
+AFFIRMATION_BACKINGS = ("none", "dim", "clear")
+DEFAULT_AFFIRMATIONS = [
+    "I am enough",
+    "I am worthy of love and respect",
+    "I am calm, focused, and in control",
+    "I am becoming the best version of myself",
+    "I am grateful for everything I have",
+    "I am strong, capable, and resilient",
+    "I am exactly where I need to be",
+    "I am open to new opportunities",
+    "I am safe. I am loved. I am whole.",
+    "I am in charge of how I feel",
+    "I am proud of how far I have come",
+    "I am creating a life I love",
+    "I am a magnet for good things",
+    "I am confident in my abilities",
+    "I am at peace with my past",
+    "I am allowed to rest",
+    "I am learning and growing every day",
+    "I am deserving of success",
+    "I am healthy, energized, and alive",
+    "I am the author of my story",
+    "I am loved more than I know",
+    "I am brave enough to begin",
+    "I am choosing joy today",
+    "I am free to be myself",
+    "You are doing better than you think",
+    "Your work matters",
+    "Today is full of possibility",
+]
+
+
+def default_affirmations_config():
+    return {
+        "enabled": True,
+        "messages": list(DEFAULT_AFFIRMATIONS),
+        "styles": ["decode", "catch", "type"],
+        "rotate": True,
+        "interval_seconds": 5,
+        "hold_seconds": 7,
+        "backing": "dim",
+        "font_scale": 1.25,
+        # One affirmation per line; when it loads, it replaces "messages" (kept as the offline fallback)
+        "source_url": AFFIRMATIONS_URL,
+        # Pick message and style from the wall clock, so every PC with the same list shows the same one at once
+        "clock_sync": True,
+    }
+
+
+AFFIRMATIONS_URL = "https://raw.githubusercontent.com/ImagineTheGames/MatrixRain/master/affirmations.txt"
+# Longest entrance and exit (seconds) any style takes: a clock-synced slot reserves this much around the hold
+AFFIRMATION_IN_MAX = 2.5
+AFFIRMATION_OUT_MAX = 1.6
+
+
+def parse_affirmation_list(text):
+    """One affirmation per line; blank lines and # comments are skipped."""
+    lines = (line.strip() for line in str(text).splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def affirmation_slot_seconds(cfg):
+    """Clock-synced cadence: each slot holds one affirmation (entrance, hold, exit) plus the gap."""
+    return AFFIRMATION_IN_MAX + cfg["hold_seconds"] + AFFIRMATION_OUT_MAX + cfg["interval_seconds"]
+
+
+def clock_affirmation(slot, messages, styles, rotate):
+    """(message, style) for clock slot number `slot`. Depends only on its arguments, so PCs with the same
+    list and settings agree. Messages come in shuffled rounds (every one once per round), never twice in a row."""
+    style = styles[slot % len(styles)] if rotate else styles[0]
+    n = len(messages)
+    if n <= 2:
+        return messages[slot % n], style
+    deck, pos = divmod(slot, n)
+
+    def order(d):
+        o = list(range(n))
+        random.Random(d).shuffle(o)
+        return o
+
+    o = order(deck)
+    if o[0] == order(deck - 1)[-1]:  # swapping the first two keeps each round's last message as it was
+        o[0], o[1] = o[1], o[0]
+    return messages[o[pos]], style
 
 # Hue cycle speed in degrees per second of wall-clock time (~17 s per full loop).
 # Derived from the clock (not frame count) so every PC with a synced clock shows the same color.
@@ -243,6 +335,36 @@ def _safe_int(val, default):
     except (TypeError, ValueError):
         return default
 
+def _safe_float(val, default):
+    """Return float(val) or default if invalid."""
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+def normalize_affirmations(cfg):
+    """Fill missing affirmation settings with defaults and clamp the rest to usable values."""
+    out = default_affirmations_config()
+    if not isinstance(cfg, dict):
+        return out
+    out["enabled"] = bool(cfg.get("enabled", out["enabled"]))
+    if isinstance(cfg.get("messages"), list):
+        out["messages"] = [str(m).strip() for m in cfg["messages"] if str(m).strip()]
+    if isinstance(cfg.get("styles"), list):
+        out["styles"] = [s for s in cfg["styles"] if s in AFFIRMATION_STYLES] or ["decode"]
+    out["rotate"] = bool(cfg.get("rotate", out["rotate"]))
+    out["interval_seconds"] = max(1.0, min(3600.0, _safe_float(cfg.get("interval_seconds"), out["interval_seconds"])))
+    out["hold_seconds"] = max(1.0, min(60.0, _safe_float(cfg.get("hold_seconds"), out["hold_seconds"])))
+    if cfg.get("backing") in AFFIRMATION_BACKINGS:
+        out["backing"] = cfg["backing"]
+    out["font_scale"] = max(0.5, min(4.0, _safe_float(cfg.get("font_scale"), out["font_scale"])))
+    if isinstance(cfg.get("source_url"), str):
+        out["source_url"] = cfg["source_url"].strip()
+    out["clock_sync"] = bool(cfg.get("clock_sync", out["clock_sync"]))
+    if "comment" in cfg:
+        out["comment"] = cfg["comment"]
+    return out
+
 def load_config():
     """Load configuration from JSON file"""
     default_config = {
@@ -255,6 +377,7 @@ def load_config():
         "screensaver": {"enabled": True, "idle_seconds": 60, "black_background": False},
         "mouse_highlight": False,
         "hue": {"shift": 0, "cycle": False},
+        "affirmations": default_affirmations_config(),
     }
     try:
         if os.path.exists(CONFIG_PATH):
@@ -297,6 +420,7 @@ def load_config():
                     config["hue"][k] = default
                 elif k == "shift":
                     config["hue"][k] = max(0, min(360, _safe_int(config["hue"][k], 0)))
+            config["affirmations"] = normalize_affirmations(config.get("affirmations"))
             return config
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(default_config, f, indent=4)
@@ -388,6 +512,277 @@ def save_speed(speed_min, speed_max):
     except Exception as e:
         print(f"Could not save speed: {e}")
         return load_config()
+
+def save_affirmations_enabled(enabled):
+    """Turn the centred affirmations on or off in the config file and return the updated config."""
+    try:
+        config = load_config()
+        config["affirmations"]["enabled"] = bool(enabled)
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4)
+        return config
+    except Exception as e:
+        print(f"Could not save affirmations: {e}")
+        return load_config()
+
+
+def wrap_words(text, max_cols):
+    """Greedy word wrap into lines of at most max_cols characters (a longer word gets a line of its own)."""
+    lines, cur = [], ""
+    for word in str(text).split():
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= max_cols:
+            cur += " " + word
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+class Affirmation:
+    """One affirmation on screen: its letters laid out in a centred block and its timeline (seconds)."""
+    FADE_IN = 0.6
+    TYPE_OUT = 0.75   # terminal style: seconds to backspace the whole line
+    FALL_ACCEL = 26.0  # decode/catch exit: letters drip down at this many rows/s^2
+
+    def __init__(self, text, style, hold, width, height, cell_w, cell_h, rng):
+        self.text, self.style, self.hold = text, style, hold
+        self.cell_w, self.cell_h = cell_w, cell_h
+        self.t = 0.0
+        max_cols = max(10, int(width * 0.62 / max(1, cell_w)))
+        self.lines = wrap_words(text, max_cols) or [text]
+        self.top = round(height / 2 - len(self.lines) * cell_h / 2)
+        # Terminal style types faster for long lines so every entrance fits in AFFIRMATION_IN_MAX
+        type_step = min(0.055, 1.85 / max(1, sum(len(line) for line in self.lines)))
+        self.cells = []  # [char, x, y, index in message, entrance time]
+        for li, line in enumerate(self.lines):
+            left = round(width / 2 - len(line) * cell_w / 2)
+            for ci, ch in enumerate(line):
+                k = len(self.cells)
+                if style == "decode":
+                    at = rng.uniform(0.15, 1.4)
+                elif style == "catch":
+                    at = rng.uniform(0.2, 1.8)
+                elif style == "type":
+                    at = 0.25 + k * type_step
+                else:
+                    at = 0.1
+                self.cells.append((ch, left + ci * cell_w, self.top + li * cell_h, k, at))
+        self.in_dur = max(c[4] for c in self.cells) + 0.35
+        self.out_dur = 0.9 if style == "type" else 1.6
+        self.end = self.in_dur + hold + self.out_dur
+        widest = max(len(line) for line in self.lines)
+        self.band = (round(width / 2 - widest * cell_w / 2), self.top,
+                     round(width / 2 + widest * cell_w / 2), self.top + len(self.lines) * cell_h)
+
+    def phase(self):
+        if self.t < self.in_dur:
+            return "in"
+        return "hold" if self.t < self.in_dur + self.hold else "out"
+
+    def presence(self):
+        """0..1: how strongly the affirmation (and its backing) is on screen."""
+        t = self.t
+        if t < self.in_dur:
+            return min(1.0, t / self.FADE_IN)
+        out = t - self.in_dur - self.hold
+        return 1.0 if out < 0 else max(0.0, 1.0 - out / self.out_dur)
+
+    def ops(self, rng):
+        """Draw list for this moment: (kind, char, x, y, alpha, white, glow). kind is "letter" (the text,
+        white = flash toward white, glow = extra halo), "scramble" (a dim random glyph), "drop_head" /
+        "drop_trail" (a falling rain drop), or "cursor" (terminal block; char is None)."""
+        t, style, ch_h = self.t, self.style, self.cell_h
+        phase = self.phase()
+        out_t = t - self.in_dur - self.hold
+        breathe = 0.15 * (1 + math.sin(t * 2.2)) if phase == "hold" else 0.0
+        n = len(self.cells)
+        ops = []
+        last_shown = None
+        for ch, x, y, k, at in self.cells:
+            if ch == " ":
+                if style == "type" and (t >= at if phase != "out" else k < n - int(out_t / self.TYPE_OUT * n)):
+                    last_shown = (x, y)
+                continue
+            if phase == "out":
+                if style == "type":
+                    if k >= n - int(out_t / self.TYPE_OUT * n):
+                        continue
+                    ops.append(("letter", ch, x, y, 1.0, 0.0, 0.0))
+                    last_shown = (x, y)
+                elif style == "bloom":
+                    ops.append(("letter", ch, x, y, max(0.0, 1 - out_t / 1.4), 0.0, 0.0))
+                else:
+                    # Letters scramble back into glyphs and drip down like rain
+                    o = out_t - (k * 37 % 11) / 11 * 0.5
+                    if o <= 0:
+                        ops.append(("letter", ch, x, y, 1.0, 0.0, 0.0))
+                        continue
+                    alpha = 1 - o / 1.1
+                    if alpha <= 0:
+                        continue
+                    glyph = rng.choice(MATRIX_CHARS) if rng.random() < 0.35 else ch
+                    fall = 0.5 * self.FALL_ACCEL * o * o * ch_h
+                    ops.append(("letter", glyph, x, y + fall, alpha, max(0.0, 1 - o * 3), 0.0))
+                continue
+            since = t - at
+            if style == "decode":
+                if since < 0:
+                    if t > 0.05:
+                        ops.append(("scramble", rng.choice(MATRIX_CHARS), x, y, 0.55, 0.0, 0.0))
+                else:
+                    ops.append(("letter", ch, x, y, 1.0, max(0.0, 1 - since / 0.45), breathe))
+            elif style == "catch":
+                if since < 0:
+                    p = 1 + since / 0.55  # a drop races down this column, landing at the letter's time
+                    if p > 0:
+                        head_y = y - (1 - p) * (y + ch_h)
+                        ops.append(("drop_head", rng.choice(MATRIX_CHARS), x, head_y, 1.0, 0.0, 0.0))
+                        for j in range(1, 6):
+                            ops.append(("drop_trail", rng.choice(MATRIX_CHARS), x, head_y - j * ch_h,
+                                        (1 - j / 6) * 0.8, 0.0, 0.0))
+                else:
+                    ops.append(("letter", ch, x, y, 1.0, max(0.0, 1 - since / 0.5), breathe))
+            elif style == "type":
+                if since >= 0:
+                    ops.append(("letter", ch, x, y, 1.0, max(0.0, 1 - since / 0.2), breathe))
+                    last_shown = (x, y)
+            else:
+                ops.append(("letter", ch, x, y, min(1.0, t / 1.1), 0.0, min(1.0, t / 0.8) * 0.6 + breathe))
+        if style == "type":
+            presence = self.presence()
+            if presence > 0.05 and (phase == "in" or int(t * 2.4) % 2 == 0):
+                if last_shown is None:
+                    cx, cy = self.cells[0][1], self.cells[0][2]
+                else:
+                    cx, cy = last_shown[0] + self.cell_w, last_shown[1]
+                ops.append(("cursor", None, cx, cy, 0.9 * presence, 0.0, 0.0))
+        return ops
+
+
+class AffirmationPlayer:
+    """Decides when the next affirmation starts, which message and entrance style it gets, and advances
+    the one on screen. Pure Python (no Qt) so the timing is testable; the widget draws Affirmation.ops()."""
+    FIRST_DELAY = 2.0  # seconds after the rain starts
+
+    def __init__(self, rng=None):
+        self.rng = rng or random.Random()
+        self.current = None
+        self.wait = self.FIRST_DELAY
+        self._last_message = None
+        self._style_index = -1
+        self._clock_slot = None  # clock-synced mode: slot already shown (or skipped)
+
+    def reset(self):
+        """The rain (re)started: clear the screen and show the first affirmation shortly."""
+        self.current = None
+        self.wait = self.FIRST_DELAY
+        self._clock_slot = None
+
+    def _next_style(self, cfg):
+        styles = cfg["styles"]
+        if not cfg["rotate"]:
+            return styles[0]
+        self._style_index = (self._style_index + 1) % len(styles)
+        return styles[self._style_index]
+
+    def _next_message(self, messages):
+        choices = [m for m in messages if m != self._last_message] or messages
+        msg = self.rng.choice(choices)
+        self._last_message = msg
+        return msg
+
+    def update(self, dt, cfg, width, height, cell_w, cell_h, messages=None, now=None):
+        """Advance dt seconds. Returns the new Affirmation when one starts this step, else None.
+        messages overrides cfg["messages"] (e.g. the synced list); now is the Unix time (clock-synced mode)."""
+        messages = cfg["messages"] if messages is None else messages
+        if not cfg["enabled"] or not messages:
+            self.current = None
+            return None
+        if cfg.get("clock_sync"):
+            return self._update_clock(cfg, messages, time.time() if now is None else now,
+                                      width, height, cell_w, cell_h)
+        if self.current is not None:
+            self.current.t += dt
+            if self.current.t >= self.current.end:
+                self.current = None
+                self.wait = cfg["interval_seconds"]
+            return None
+        self.wait -= dt
+        if self.wait > 0:
+            return None
+        self.current = Affirmation(self._next_message(messages), self._next_style(cfg),
+                                   cfg["hold_seconds"], width, height, cell_w, cell_h, self.rng)
+        return self.current
+
+    def _update_clock(self, cfg, messages, now, width, height, cell_w, cell_h):
+        """Clock-synced mode: slot k of the day-independent Unix timeline starts at k * slot length on
+        every PC; its message, style and letter timings come from k alone."""
+        slot_len = affirmation_slot_seconds(cfg)
+        slot = int(now // slot_len)
+        start = slot * slot_len
+        if self.current is not None:
+            self.current.t = now - self.current.clock_start
+            if self.current.t < self.current.end:
+                return None
+            self.current = None
+        if slot == self._clock_slot:
+            return None
+        self._clock_slot = slot
+        msg, style = clock_affirmation(slot, messages, cfg["styles"], cfg["rotate"])
+        a = Affirmation(msg, style, cfg["hold_seconds"], width, height, cell_w, cell_h, random.Random(slot))
+        a.t = now - start
+        if a.t > a.in_dur:
+            return None  # joined after its entrance: stay in step and wait for the next slot
+        a.clock_start = start
+        self.current = a
+        return a
+
+
+class AffirmationFeed:
+    """The affirmation list from a text file on the web (one per line), fetched on a background thread
+    and cached on disk so the last good copy survives restarts and offline PCs."""
+    REFRESH_SECONDS = 3600
+    RETRY_SECONDS = 300
+
+    def __init__(self, cache_path):
+        self.cache_path = cache_path
+        self.messages = []
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                self.messages = parse_affirmation_list(f.read())
+        except OSError:
+            pass
+        self._next_fetch = 0.0
+        self._busy = False
+
+    def poll(self, url):
+        """Start a fetch if one is due; cheap enough to call every frame."""
+        if not url or self._busy or time.monotonic() < self._next_fetch:
+            return
+        self._busy = True
+        self._next_fetch = time.monotonic() + self.RETRY_SECONDS  # pushed out to REFRESH_SECONDS on success
+        threading.Thread(target=self._fetch, args=(url,), daemon=True).start()
+
+    def _fetch(self, url):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "MatrixRain", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read(1_000_000).decode("utf-8")
+            messages = parse_affirmation_list(text)
+            if messages:
+                self.messages = messages
+                self._next_fetch = time.monotonic() + self.REFRESH_SECONDS
+                with open(self.cache_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(messages) + "\n")
+        except Exception as e:
+            print(f"Could not fetch affirmations from {url}: {e}")
+        finally:
+            self._busy = False
+
 
 class MatrixColumn:
     """Represents a single column of falling characters. Always starts above screen and falls top to bottom."""
@@ -607,6 +1002,10 @@ class MatrixRainWidget(QWidget):
         super().__init__()
         # Load configuration
         self.config = load_config()
+        self.affirm = AffirmationPlayer()
+        self._affirm_atlas = None  # built on first use: (font scale, atlas, text cell size)
+        self.affirm_feed = AffirmationFeed(os.path.join(_base_dir(), "affirmations_cache.txt"))
+        self.affirm_feed.poll((self.config.get("affirmations") or {}).get("source_url"))
         self.init_ui()
         self.init_matrix()
         # Black-background screensaver window; swapped for the GPU-drawn one on first use (see
@@ -721,6 +1120,98 @@ class MatrixRainWidget(QWidget):
         except Exception:
             return
         self.paint_rain(painter)
+        self.paint_affirmation(painter)
+
+    def _affirmation_sprites(self, cfg):
+        """(atlas, (cell_w, cell_h)) for the affirmation text: the rain font scaled up, rebuilt if the scale changes."""
+        scale = cfg.get("font_scale", 1.25)
+        if self._affirm_atlas is None or self._affirm_atlas[0] != scale:
+            size = self.font.pointSizeF() if self.font.pointSizeF() > 0 else 14.0
+            font = QFont(self.font.family(), max(1, round(size * scale)), QFont.Bold)
+            atlas = GlyphAtlas(font)
+            atlas.add_chars("".join(cfg.get("messages") or []))
+            fm = QFontMetrics(font)
+            # Letters sit on a wide monospace grid, like the rain's own columns
+            cell = (max(2, round(max(1, fm.width("M")) * 1.5)), max(2, fm.height()))
+            self._affirm_atlas = (scale, atlas, cell)
+        return self._affirm_atlas[1], self._affirm_atlas[2]
+
+    def paint_affirmation(self, painter):
+        """Draw the affirmation on screen (if any) over the rain: the backing, then its glyph sprites."""
+        a = self.affirm.current
+        if a is None or self._affirm_atlas is None:
+            return
+        atlas = self._affirm_atlas[1]
+        painter.save()
+        try:
+            presence = a.presence()
+            x0, y0, x1, y1 = a.band
+            backing = (self.config.get("affirmations") or {}).get("backing", "dim")
+            if backing == "dim" and presence > 0:
+                # Wide black halo that fades the rain toward the text (on the overlay it also darkens the desktop)
+                grad = QRadialGradient(0, 0, 1)
+                grad.setColorAt(0, QColor(0, 0, 0, int(150 * presence)))
+                grad.setColorAt(1, QColor(0, 0, 0, 0))
+                painter.save()
+                painter.translate((x0 + x1) / 2, (y0 + y1) / 2)
+                painter.scale(self.width() * 0.45, max(a.cell_h * 5, (y1 - y0 + 4 * a.cell_h) * 1.4))
+                painter.fillRect(QRectF(-1, -1, 2, 2), QBrush(grad))
+                painter.restore()
+                # Then a feathered strip hugging the text, so passing drops do not cross the letters:
+                # stacked rounded rects, each a little larger and adding a little more black toward the middle
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(0, 0, 0, int(76 * presence)))
+                step = a.cell_h * 0.3
+                for i in range(6):
+                    grow = step * (5 - i)
+                    painter.drawRoundedRect(QRectF(x0 - a.cell_w * 0.5 - grow, y0 - a.cell_h * 0.25 - grow,
+                                                   x1 - x0 + a.cell_w + 2 * grow, y1 - y0 + a.cell_h * 0.5 + 2 * grow),
+                                            a.cell_h * 0.6 + grow, a.cell_h * 0.6 + grow)
+            elif backing == "clear" and presence > 0:
+                pad = a.cell_h * 1.5
+                grad = QLinearGradient(0, y0 - pad, 0, y1 + pad)
+                solid = QColor(0, 0, 0, int(230 * presence))
+                grad.setColorAt(0, QColor(0, 0, 0, 0))
+                grad.setColorAt(0.25, solid)
+                grad.setColorAt(0.75, solid)
+                grad.setColorAt(1, QColor(0, 0, 0, 0))
+                painter.fillRect(QRectF(0, y0 - pad, self.width(), y1 - y0 + 2 * pad), QBrush(grad))
+            strength, radius = self.glow_settings()
+            hue = self._effective_hue_degrees()
+            atlas.prepare(strength, radius, hue)
+            images, slots = atlas.images, atlas.slots
+            cw, chh, pad = atlas.cell_w, atlas.cell_h, atlas.PAD
+            cursor_rgb = hue_shift_rgb(atlas.TIERS["near"][1], int(hue) % 360)
+
+            def blit(name, opacity):
+                if opacity > 0.004:
+                    painter.setOpacity(min(1.0, opacity))
+                    painter.drawImage(dx, dy, images[name], sx, sy, cw, chh)
+
+            for kind, ch, x, y, alpha, white, glow in a.ops(self.affirm.rng):
+                if kind == "cursor":
+                    painter.setOpacity(alpha)
+                    painter.fillRect(QRectF(x + 2, y + 2, a.cell_w - 3, a.cell_h - 2), QColor(*cursor_rgb))
+                    continue
+                slot = slots.get(ch)
+                if slot is None:
+                    continue
+                sx, sy = slot
+                dx, dy = int(x) - pad, int(y) - pad
+                if kind == "letter":
+                    blit("head2", alpha)
+                    blit("head_glow", alpha * (0.35 + glow))
+                    blit("head_core", alpha * white)
+                elif kind == "scramble":
+                    blit("trail", alpha)
+                elif kind == "drop_head":
+                    blit("head_glow", alpha)
+                    blit("head_core", alpha)
+                else:
+                    blit("near", alpha)
+        except Exception:
+            pass
+        painter.restore()
 
     def paint_rain(self, painter):
         """Draw the rain with painter; shared by this overlay and the solid screensaver window."""
@@ -840,6 +1331,18 @@ class MatrixRainWidget(QWidget):
             columns = getattr(self, "columns", [])
             for col in columns:
                 col.update(height, steps)
+            affirm_cfg = self.config.get("affirmations")
+            if isinstance(affirm_cfg, dict) and affirm_cfg.get("enabled"):
+                atlas, (cell_w, cell_h) = self._affirmation_sprites(affirm_cfg)
+                url = affirm_cfg.get("source_url")
+                self.affirm_feed.poll(url)
+                messages = (self.affirm_feed.messages if url else None) or affirm_cfg["messages"]
+                started = self.affirm.update(steps / ANIMATION_STEPS_PER_SEC, affirm_cfg,
+                                             self.width(), height, cell_w, cell_h, messages)
+                if started is not None:
+                    atlas.add_chars(started.text)
+            else:
+                self.affirm.current = None
             # Hue cycle angle is derived from the wall clock in _effective_hue_degrees (no per-frame state)
             messages = self.config.get("custom_messages") or []
             if messages:
@@ -922,6 +1425,7 @@ class MatrixRainWidget(QWidget):
         configured 33 ms; the precise one reaches the configured fps but is only worth it when frames
         are cheap (GPU screensaver). Motion is time-based, so both look the same apart from smoothness."""
         self._last_tick = None
+        self.affirm.reset()
         self.timer.setTimerType(Qt.PreciseTimer if precise else Qt.CoarseTimer)
         self.timer.start(self._animation_interval)
 
@@ -948,7 +1452,7 @@ class MatrixRainWidget(QWidget):
             self._solid_saver.hide()
             self.hide()
             self.timer.stop()  # hideEvent does not fire if only the solid window was showing
-            self.atlas.trim()
+            self._trim_atlases()
 
     def mousePressEvent(self, event):
         if getattr(self, "_screensaver_active", False):
@@ -1037,9 +1541,14 @@ class MatrixRainWidget(QWidget):
         screensaver is active, clear its state so it is not left 'active' but frozen."""
         super().hideEvent(event)
         self.timer.stop()
-        self.atlas.trim()  # derived sprite images are rebuilt on the next frame drawn
+        self._trim_atlases()  # derived sprite images are rebuilt on the next frame drawn
         if getattr(self, "_screensaver_active", False):
             self._dismiss_screensaver()
+
+    def _trim_atlases(self):
+        self.atlas.trim()
+        if self._affirm_atlas is not None:
+            self._affirm_atlas[1].trim()
 
     def closeEvent(self, event):
         """Hide to system tray instead of quitting."""
@@ -1115,6 +1624,11 @@ class MatrixRainWidget(QWidget):
         self.mouse_highlight_action.setChecked(bool(self.config.get("mouse_highlight", False)))
         self.mouse_highlight_action.triggered.connect(self.toggle_mouse_highlight)
         menu.addAction(self.mouse_highlight_action)
+        self.affirmations_action = QAction("Affirmations", self)
+        self.affirmations_action.setCheckable(True)
+        self.affirmations_action.setChecked(bool((self.config.get("affirmations") or {}).get("enabled")))
+        self.affirmations_action.triggered.connect(self.toggle_affirmations)
+        menu.addAction(self.affirmations_action)
         self.startup_action = QAction("Start with Windows", self)
         self.startup_action.setCheckable(True)
         self.startup_action.setChecked(is_startup_enabled())
@@ -1201,6 +1715,12 @@ class MatrixRainWidget(QWidget):
             self.mouse_highlight_action.setChecked(new_val)
         self.update()
 
+    def toggle_affirmations(self, checked):
+        """Turn the centred affirmations on or off and save."""
+        self.config = save_affirmations_enabled(checked)
+        self.affirm.reset()
+        self.affirmations_action.setChecked(bool(self.config["affirmations"]["enabled"]))
+
     def toggle_startup(self, checked):
         """Register or unregister the app to start with Windows; revert the menu check on failure."""
         if not set_startup_enabled(checked):
@@ -1244,6 +1764,7 @@ class SolidScreensaverWindow(QWidget):
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.black)
         self.rain.paint_rain(painter)
+        self.rain.paint_affirmation(painter)
 
     def mousePressEvent(self, event):
         self.rain.mousePressEvent(event)
@@ -1340,7 +1861,7 @@ void main() {
 }
 """
 
-_GL_TEXTURE_2D, _GL_TRIANGLES, _GL_COLOR_BUFFER_BIT = 0x0DE1, 0x0004, 0x4000
+_GL_TEXTURE_2D, _GL_TRIANGLES, _GL_COLOR_BUFFER_BIT, _GL_TEXTURE0 = 0x0DE1, 0x0004, 0x4000, 0x84C0
 
 
 def gl_surface_format():
@@ -1498,6 +2019,10 @@ class GLRainRenderer:
         gl.glDrawArrays(_GL_TRIANGLES, 0, 3)
         self.vao.release()
         self.program.release()
+        # Leave texture units as QPainter expects them (it draws the affirmation on top, using unit 0)
+        for unit, tex in enumerate(self._mask_textures + [self._cols_tex, self._chars_tex]):
+            tex.release(unit)
+        gl.glActiveTexture(_GL_TEXTURE0)
 
 
 _gl_support = None
@@ -1551,6 +2076,11 @@ class GLScreensaverWindow(QOpenGLWindow):
         if self.renderer.ready:
             dpr = self.devicePixelRatio()
             self.renderer.render(self.rain, round(self.width() * dpr), round(self.height() * dpr), dpr)
+            if self.rain.affirm.current is not None:
+                # A handful of sprites: QPainter's GL engine draws them over the shader's rain
+                painter = QPainter(self)
+                self.rain.paint_affirmation(painter)
+                painter.end()
 
     def mousePressEvent(self, event):
         self.rain.mousePressEvent(event)
