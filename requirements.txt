@@ -1,0 +1,2 @@
+# Matrix Rain - run from source
+PyQt5>=5.15
