@@ -23,3 +23,8 @@ Thumbs.db
 
 # Affirmations list fetched from GitHub (per machine)
 affirmations_cache.txt
+
+# Private release / Store publishing notes and editor rules (local only)
+store/PUBLISH_CLI.md
+store/FEATURES_AND_LISTING.md
+.cursor/
